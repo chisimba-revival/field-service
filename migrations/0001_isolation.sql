@@ -167,6 +167,13 @@ alter table sighting force row level security;
 drop policy if exists drive_in_granted_context on drive;
 drop policy if exists sighting_in_granted_context on sighting;
 
+-- The with-check clause is redundant here and is kept deliberately: PostgreSQL
+-- applies the using expression to inserts when no with check is given, so
+-- dropping it changes nothing (confirmed by removing it and re-running the
+-- tests). It stays because a reader should not have to know that to be sure a
+-- write cannot land in an ungranted context, and because the day the using
+-- expression becomes an OR of two predicates the redundancy stops being
+-- harmless.
 create policy drive_in_granted_context on drive
   using (context_code = any (string_to_array(current_setting('app.context_grants'), ',')))
   with check (context_code = any (string_to_array(current_setting('app.context_grants'), ',')));
