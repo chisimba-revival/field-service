@@ -1,0 +1,55 @@
+# The databases this service needs, and nothing else.
+#
+# The design calls for PostgreSQL with PostGIS and a Redis. This file exists so
+# that is reproducible rather than something somebody set up once on a machine
+# and then could not rebuild. The schema itself is not here: it is applied by
+# migrations, so that the order they run in is recorded in the repository.
+#
+# Ports are published directly rather than reached through a tunnel container.
+# A tunnel is only necessary when the database container does not publish a
+# port, and it adds a process whose failure looks like the database failing.
+#
+# These ports are deliberately not the defaults. 5432 and 6379 collide with
+# whatever else is running on the machine, and the failure mode of that
+# collision is another project's service failing in a confusing way.
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: fieldsvc
+      POSTGRES_PASSWORD: fieldsvc
+      POSTGRES_DB: fieldlog
+      # PostGIS refuses to initialise its extension scripts on a database whose
+      # locale is not set, and the failure is a confusing one. Setting it here
+      # means a fresh volume comes up with spatial support already present.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "55433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Refusing connections is not the same as being unable to answer them, so
+      # this asks a question rather than testing the port.
+      test: ["CMD-SHELL", "pg_isready -U fieldsvc -d fieldlog"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # The design's admission test for anything in Redis is that it is never the
+    # only copy of anything, which is what lets it be configured to evict rather
+    # than to persist. If that ever stops being true this line is the first
+    # thing that needs revisiting.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "56380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
