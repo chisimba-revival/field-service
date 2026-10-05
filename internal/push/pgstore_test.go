@@ -720,3 +720,52 @@ func TestAGoodOperationInTheSameBatchStillLands(t *testing.T) {
 			"and had one malformed needs the other two.", got[1].Outcome)
 	}
 }
+
+// captured_at and recorded_at are two facts, not one.
+//
+// They were bound from the same value — both from op.CapturedAt — which makes
+// them permanently identical and hides the difference the contract cares about:
+// "conflating them makes an offline entry look late when it is not." A sighting
+// made at dawn and written up that evening is not a stale observation, and a
+// record that cannot show the difference will treat it as one.
+func TestCapturedAndRecordedTimesAreNotTheSameFact(t *testing.T) {
+	svc, conn := service(t, ctxNorth)
+	defer func() { _ = conn.Close(context.Background()) }()
+	seedDrive(t, conn, driveNorth, ctxNorth)
+
+	driveID := driveNorth
+	captured := time.Date(2026, 10, 4, 6, 14, 0, 0, time.UTC) // dawn
+	written := time.Date(2026, 10, 4, 19, 40, 0, 0, time.UTC) // written up that evening
+
+	op := aCreate("op-two-times", driveID, "LEOP", 1)
+	op.Payload["drive_id"] = driveID
+	op.CapturedAt = captured
+	op.RecordedAt = written
+
+	got, err := svc.Push(context.Background(),
+		push.Caller{ID: "user-1", WriteContext: ctxNorth}, []push.Operation{op})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Outcome != push.OutcomeApplied {
+		t.Fatalf("outcome %q", got[0].Outcome)
+	}
+
+	var gotCaptured, gotRecorded time.Time
+	if err := conn.QueryRow(context.Background(),
+		`select captured_at, recorded_at from sighting s where s.id = $1`,
+		op.EntityID).Scan(&gotCaptured, &gotRecorded); err != nil {
+		t.Fatal(err)
+	}
+
+	if !gotCaptured.UTC().Equal(captured) {
+		t.Errorf("captured_at %s, want %s", gotCaptured.UTC(), captured)
+	}
+	if !gotRecorded.UTC().Equal(written) {
+		t.Errorf("recorded_at %s, want %s", gotRecorded.UTC(), written)
+	}
+	if gotCaptured.UTC().Equal(gotRecorded.UTC()) {
+		t.Error("captured_at and recorded_at came back identical. The two are " +
+			"separate facts and a client is entitled to send both.")
+	}
+}

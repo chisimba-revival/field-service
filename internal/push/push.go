@@ -110,7 +110,21 @@ type Operation struct {
 	// record does not exist yet.
 	BaseRevision *int64 `json:"base_revision"`
 
-	CapturedAt time.Time      `json:"captured_at"`
+	// CapturedAt is when the trainee observed the thing.
+	CapturedAt time.Time `json:"captured_at"`
+
+	// RecordedAt is when the device wrote the record down, which is not the same
+	// moment and is very often hours or days later.
+	//
+	// It exists as a separate field because rule 13 keeps the two apart, and
+	// because the contract's reason is practical rather than tidy: conflating
+	// them "makes an offline entry look late when it is not". A sighting made at
+	// dawn and written up that evening is not a stale observation.
+	//
+	// Zero means the client did not say, and the service then records its own
+	// time. Zero is not treated as a real time because a zero timestamp is not a
+	// moment anybody observed anything.
+	RecordedAt time.Time      `json:"recorded_at"`
 	Payload    map[string]any `json:"payload"`
 	DependsOn  []string       `json:"depends_on,omitempty"`
 

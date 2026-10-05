@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -50,11 +51,23 @@ func (s *PgxStore) Begin(ctx context.Context) (Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &pgxTx{tx: tx}, nil
+	return &pgxTx{tx: tx, now: time.Now().UTC}, nil
 }
 
 // pgxTx is one open transaction.
-type pgxTx struct{ tx pgx.Tx }
+type pgxTx struct {
+	tx pgx.Tx
+	// now is the service's own clock, injectable so a test can tell a
+	// service-recorded time from a client-supplied one.
+	now func() time.Time
+}
+
+func (t *pgxTx) clock() time.Time {
+	if t.now == nil {
+		return time.Now().UTC()
+	}
+	return t.now()
+}
 
 func (t *pgxTx) Commit(ctx context.Context) error   { return t.tx.Commit(ctx) }
 func (t *pgxTx) Rollback(ctx context.Context) error { return t.tx.Rollback(ctx) }
@@ -190,7 +203,7 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 		payloadFloatPtr(op.Payload, "location_accuracy_m"), payloadIntPtr(op.Payload, "distance_m"),
 		payloadIntPtr(op.Payload, "bearing_deg"), payloadTextPtr(op.Payload, "behaviour"),
 		payloadTextPtr(op.Payload, "age_sex_class"), payloadTextPtr(op.Payload, "notes"),
-		op.CapturedAt, op.CapturedAt, caller.ID,
+		op.CapturedAt, recordedAt(op, t.now()), caller.ID,
 	).Scan(&revision)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -452,6 +465,22 @@ func payloadFloatPtr(m map[string]any, k string) *float64 {
 // format is checked by hand rather than parsed, because the only question is
 // "would the database accept this", and a parser would be a second, looser idea
 // of the same thing.
+// recordedAt is when the record was written down, which rule 13 says is a
+// different fact from when the thing was seen.
+//
+// The client's value is preferred because it knows when the trainee actually
+// wrote it down, and a device out of coverage records that honestly. A client
+// that did not say gets the service's own clock rather than a copy of
+// captured_at: binding both from one value makes the two permanently identical,
+// which is the thing rule 13 exists to prevent, and it would hide the difference
+// between an observation made at dawn and an entry written up that evening.
+func recordedAt(op Operation, now time.Time) time.Time {
+	if !op.RecordedAt.IsZero() {
+		return op.RecordedAt
+	}
+	return now
+}
+
 func isUUID(s string) bool {
 	if len(s) != 36 {
 		return false
