@@ -113,6 +113,14 @@ func (t *pgxTx) Apply(ctx context.Context, caller Caller, op Operation) (Result,
 	var err error
 	switch op.Kind {
 	case "create":
+		// The entity is dispatched on before the kind is handled further down, so
+		// that adding an entity does not mean adding a case to every handler. A
+		// create names what it is creating; the handlers below each check that
+		// too, and refuse an entity they do not serve.
+		if op.Entity == "outing" {
+			res, err = t.createOuting(ctx, caller, op)
+			break
+		}
 		res, err = t.create(ctx, caller, op)
 	case "correct":
 		res, err = t.correct(ctx, caller, op)
@@ -167,7 +175,7 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 
 	// A payload missing a field it must carry is refused, not attempted.
 	//
-	// Found by sending a real request with no drive_id: it became the empty
+	// Found by sending a real request with no outing_id: it became the empty
 	// string, the insert failed with "invalid input syntax for type uuid", and
 	// the whole batch came back as a 500. Every other client mistake here is
 	// refused — an unknown kind, a create carrying a base_revision, a correction
@@ -175,22 +183,22 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 	// an inconsistency as well as a fault. Worse than the 500 was the direction:
 	// one bad operation in a batch of four took all four with it, and the rule is
 	// that a batch is not all-or-nothing.
-	if !isUUID(payloadUUID(op.Payload, "drive_id")) {
+	if !isUUID(payloadUUID(op.Payload, "outing_id")) {
 		return Result{
 			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
-			Outcome: OutcomeRefused, ErrorCode: "create_without_drive_id",
+			Outcome: OutcomeRefused, ErrorCode: "create_without_outing_id",
 			ClientState: op.Payload,
 		}, nil
 	}
 
-	// A drive that does not exist, or exists in a context this caller cannot
+	// An outing that does not exist, or exists in a context this caller cannot
 	// write to, is refused here rather than left to the foreign key.
 	//
 	// Two reasons, and they are different in kind.
 	//
 	// The first is consistency. Every other client mistake in this file is a
 	// refusal — an unknown kind, a create carrying a base_revision, a missing
-	// drive_id. A drive that is not there is the same kind of mistake, and it was
+	// outing_id. An outing that is not there is the same kind of mistake, and it was
 	// arriving as a 500 because the constraint violation was the thing reporting
 	// it. Worse than the status was the direction: one bad operation in a batch
 	// of four took all four with it, and a batch is not all-or-nothing.
@@ -199,23 +207,23 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 	// its own transaction and never sets app.context_grants, and the runtime it
 	// is deployed against is a superuser, which PostgreSQL exempts from
 	// row-level security outright. The policies would not have caught this even
-	// if the foreign key had been satisfied — so a drive in another context is
+	// if the foreign key had been satisfied — so an outing in another context is
 	// refused because this code compares the two, not because something
 	// downstream was trusted to.
 	//
 	// The two cases deliberately share one error code. Reporting "no such
-	// drive" for a drive that exists in somebody else's context would turn this
-	// into an oracle: a caller could walk the id space and learn which drives
+	// outing" for one that exists in somebody else's context would turn this
+	// into an oracle: a caller could walk the id space and learn which outings
 	// other reserves have planned, which is exactly what the grant set exists to
 	// withhold.
-	known, err := t.driveInContext(ctx, payloadUUID(op.Payload, "drive_id"), caller.WriteContext)
+	known, err := t.outingInContext(ctx, payloadUUID(op.Payload, "outing_id"), caller.WriteContext)
 	if err != nil {
 		return Result{}, err
 	}
 	if !known {
 		return Result{
 			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
-			Outcome: OutcomeRefused, ErrorCode: "unknown_drive",
+			Outcome: OutcomeRefused, ErrorCode: "unknown_outing",
 			ClientState: op.Payload,
 		}, nil
 	}
@@ -225,7 +233,7 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 	// is bound rather than interpolated.
 	const q = `
 		insert into sighting
-		  (id, context_code, drive_id, species_code, count, location,
+		  (id, context_code, outing_id, species_code, count, location,
 		   location_accuracy_m, distance_m, bearing_deg, behaviour, age_sex_class,
 		   notes, status, captured_at, recorded_at, created_by, revision)
 		values ($1,$2,$3,$4,$5,st_setsrid(st_makepoint($6,$7),4326),
@@ -234,7 +242,7 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 
 	var revision int64
 	err = t.tx.QueryRow(ctx, q,
-		op.EntityID, caller.WriteContext, payloadUUID(op.Payload, "drive_id"),
+		op.EntityID, caller.WriteContext, payloadUUID(op.Payload, "outing_id"),
 		payloadText(op.Payload, "species_code"), payloadInt(op.Payload, "count"),
 		payloadFloat(op.Payload, "longitude"), payloadFloat(op.Payload, "latitude"),
 		payloadFloatPtr(op.Payload, "location_accuracy_m"), payloadIntPtr(op.Payload, "distance_m"),
@@ -273,19 +281,19 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 // correction without one — but a constraint violation arriving as a plain error
 // would tell the client only that something went wrong, so it is recognised here
 // and named.
-// driveInContext reports whether a drive exists in the given context.
+// outingInContext reports whether an outing exists in the given context.
 //
 // The context is compared here rather than being relied upon to be enforced
 // downstream, because on this path nothing downstream is enforcing it: see the
-// note at the refusal above. A true answer means the drive is in that context;
+// note at the refusal above. A true answer means the outing is in that context;
 // a false answer means it is not there, or is somewhere this caller cannot see,
 // and the caller is told the same thing either way.
-func (t *pgxTx) driveInContext(ctx context.Context, driveID, context string) (bool, error) {
+func (t *pgxTx) outingInContext(ctx context.Context, outingID, context string) (bool, error) {
 	const q = `select exists (
-		select 1 from drive where id = $1 and context_code = $2
+		select 1 from outing where id = $1 and context_code = $2
 	)`
 	var known bool
-	if err := t.tx.QueryRow(ctx, q, driveID, context).Scan(&known); err != nil {
+	if err := t.tx.QueryRow(ctx, q, outingID, context).Scan(&known); err != nil {
 		return false, err
 	}
 	return known, nil
