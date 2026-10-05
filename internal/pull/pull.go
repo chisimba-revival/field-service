@@ -161,15 +161,28 @@ func (s *Service) Pull(ctx context.Context, caller string, cursor string) (Page,
 		return s.resync(page), nil
 	}
 
-	lowest, err := s.store.LowestRetainedSeq(ctx)
-	if err != nil {
-		// A feed that cannot be read is not a feed with no changes. Reporting
-		// resync here would tell the client to discard cursors for the service's
-		// benefit, which is the one thing this package must never do.
-		return Page{}, err
-	}
-	if hasMissed(at, lowest) {
-		return s.resync(page), nil
+	if cursor == "" {
+		// A device that has never pulled cannot have missed anything, so the
+		// retention question does not apply to it and is not asked.
+		//
+		// Asking it anyway was a real bug, found by running against the database
+		// and impossible to find with a fake: seq is a global sequence, so after
+		// any pruning the oldest retained row is far above 1, and a brand new
+		// device arriving with no cursor was told it had fallen behind and
+		// resynced. It could not have fallen behind. Worse, the resync would not
+		// have helped it — the rows it had "missed" were gone — so it would have
+		// been told to do something that could not work, for ever.
+	} else {
+		lowest, err := s.store.LowestRetainedSeq(ctx)
+		if err != nil {
+			// A feed that cannot be read is not a feed with no changes. Reporting
+			// resync here would tell the client to discard cursors for the
+			// service's benefit, which is the one thing this package must never do.
+			return Page{}, err
+		}
+		if hasMissed(at, lowest) {
+			return s.resync(page), nil
+		}
 	}
 
 	changes, more, err := s.store.Page(ctx, at, s.quota)
@@ -189,10 +202,11 @@ func (s *Service) Pull(ctx context.Context, caller string, cursor string) (Page,
 // An uninterpretable cursor is a resync rather than an error, because the
 // contract requires it: it means the client is holding something this service
 // cannot use, and the honest repair is to start again rather than to guess.
-func ParseCursor(cursor string) (int64, bool) {
+// The second return reports whether the cursor could be read at all. An empty
+// cursor reads successfully and means "never pulled" — a full first pull, which
+// is ordinary and is not damage.
+func ParseCursor(cursor string) (at int64, ok bool) {
 	if cursor == "" {
-		// No cursor is not a resync: it is a device that has never pulled, which
-		// is a full first pull and entirely ordinary.
 		return 0, true
 	}
 	at, err := strconv.ParseInt(cursor, 10, 64)
