@@ -58,6 +58,10 @@ import (
 	"field-service/internal/wiring"
 )
 
+// integrationTestLock must match the constant in internal/store, internal/push
+// and internal/pull. See where it is used for why that is fragile.
+const integrationTestLock int64 = 821004001
+
 const (
 	issuer   = "chisimba"
 	audience = "chisimba-api"
@@ -146,11 +150,21 @@ func start(t *testing.T) *rig {
 	// sightings, so running it beside a package that asserts on sighting counts
 	// would make two suites corrupt each other's fixtures — and the failure would
 	// be an assertion about data neither suite wrote.
-	if _, err := conn.Exec(ctx, "select pg_advisory_lock($1)", int64(821004001)); err != nil {
+	//
+	// The value is repeated rather than imported because it is declared in three
+	// separate test packages, which cannot see each other. That makes it a
+	// coupling with nothing enforcing it: if one package changed its key, this
+	// one would quietly stop mutual exclusion and two suites would start
+	// corrupting each other's fixtures again. Naming where it came from is the
+	// only thing standing between a reader and a silent change.
+	if _, err := conn.Exec(ctx, "select pg_advisory_lock($1)", integrationTestLock); err != nil {
 		t.Fatalf("taking the integration-test lock: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = conn.Exec(context.Background(), "select pg_advisory_unlock($1)", int64(821004001))
+		// The connection is closed immediately after this, and closing a session
+		// releases its advisory locks anyway, so a failed unlock here is not a
+		// lock left held.
+		_, _ = conn.Exec(context.Background(), "select pg_advisory_unlock($1)", integrationTestLock)
 	})
 
 	session := wiring.NewSession(wiring.NewPgxPool(pool))
