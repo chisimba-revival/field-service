@@ -133,6 +133,22 @@ func (s *Service) WithClock(now func() time.Time) *Service {
 	return s
 }
 
+// WithQuerier returns a copy of this service that reads through q.
+//
+// A service is normally built once over a connection. That is wrong under a
+// pooled server, because the grants that decide what a caller may read are
+// transaction-local: a store built over a connection from the pool would find
+// none of them and read nothing. So the service is bound to the handle inside the
+// transaction that set them.
+//
+// Returning a copy rather than mutating matters more than it looks. A service
+// whose store is swapped in place would be unsafe the moment two requests are in
+// flight, and the failure would be a pull reading somebody else's grants.
+func (s *Service) WithQuerier(q Querier) *Service {
+	s.store = NewPgxStore(q)
+	return s
+}
+
 // Cursor renders the cursor a client should send next.
 //
 // A string, and deliberately opaque: a client that starts parsing it has taken

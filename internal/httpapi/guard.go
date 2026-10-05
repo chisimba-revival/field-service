@@ -77,7 +77,41 @@ type RevocationChecker interface {
 type Session interface {
 	InTx(ctx context.Context, callerID string, grants []string,
 		fn func(context.Context) error) error
+
+	// Querier runs fn inside a transaction carrying the caller's grants, and
+	// hands fn something it can read through.
+	//
+	// InTx alone is not enough, and the reason is worth stating because the
+	// omission looks harmless. The grants are set with set_config(..., true),
+	// which is transaction-local, so they exist only inside the transaction that
+	// set them. A read attempted outside it — or on a connection from the pool —
+	// finds no grants, and a reader that opens its own transaction has to set
+	// them itself, which duplicates the one place that decides what a caller may
+	// read and gives the duplication a chance to be forgotten.
+	Querier(ctx context.Context, callerID string, grants []string,
+		fn func(Querier) error) error
 }
+
+// Querier is what a handler reads through, and the only thing it needs.
+//
+// Deliberately narrower than a database handle: a handler cannot begin a
+// transaction, cannot commit one, and cannot set a setting. So the read boundary
+// cannot be widened from inside a handler even by accident.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) Row
+}
+
+// Rows is one result set.
+type Rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+	Close()
+}
+
+// Row is one row.
+type Row interface{ Scan(dest ...any) error }
 
 // Logger records why a request was refused.
 //

@@ -102,6 +102,19 @@ type recordingSession struct {
 	transactions int
 }
 
+// Querier is here so this fake still satisfies Session after the interface
+// gained the method. It records the same facts InTx does and then hands fn
+// something that cannot query anything — a pull needs the real handle, and
+// pretending otherwise here would let a test pass against a fake that answers
+// every read.
+func (s *recordingSession) Querier(ctx context.Context, callerID string, grants []string,
+	fn func(Querier) error) error {
+	if err := s.InTx(ctx, callerID, grants, func(context.Context) error { return nil }); err != nil {
+		return err
+	}
+	return fn(nil)
+}
+
 func (s *recordingSession) InTx(_ context.Context, callerID string, grants []string,
 	fn func(context.Context) error) error {
 	s.callerID = callerID

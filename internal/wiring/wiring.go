@@ -217,6 +217,61 @@ func (s *PgxSession) InTx(ctx context.Context, callerID string, grants []string,
 	return tx.Commit(ctx)
 }
 
+// Querier runs fn inside a transaction carrying the caller's grants and hands it
+// something to read through.
+//
+// Implemented by opening the same transaction InTx opens and sharing the setup,
+// so there is exactly one place that sets the read boundary. A second copy of
+// that setup would be a second chance to get it wrong, and getting it wrong is
+// not a crash: it is a wider read that looks like a successful one.
+func (s *PgxSession) Querier(ctx context.Context, callerID string, grants []string,
+	fn func(httpapi.Querier) error) error {
+	if strings.TrimSpace(callerID) == "" {
+		return ErrNoCaller
+	}
+	if len(grants) == 0 {
+		return ErrNoGrants
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rendered, err := joinGrants(grants)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`select set_config($1, $2, true)`, grantsSetting, rendered); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`select set_config($1, $2, true)`, callerSetting, callerID); err != nil {
+		return err
+	}
+
+	if err := fn(readable{tx}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// readable adapts the transaction to the surface a handler is allowed to use.
+//
+// It exposes no Commit and no Exec, deliberately. A handler that could write
+// outside a checked statement, or end the transaction it is reading in, would be
+// able to do things the read boundary was set up to prevent.
+type readable struct{ tx PgxTx }
+
+func (r readable) Query(ctx context.Context, sql string, args ...any) (httpapi.Rows, error) {
+	return r.tx.Query(ctx, sql, args...)
+}
+func (r readable) QueryRow(ctx context.Context, sql string, args ...any) httpapi.Row {
+	return r.tx.QueryRow(ctx, sql, args...)
+}
+
 // joinGrants renders the grant set the way the policies parse it.
 //
 // Commas are rejected inside a context code rather than escaped, because a code

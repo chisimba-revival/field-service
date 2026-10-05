@@ -15,13 +15,23 @@ import (
 // session inside the transaction. A context filter written again here would be a
 // second answer to a question the database is already answering, and the two
 // could disagree — in which case the wider one is the one that leaks.
-type PgxStore struct {
-	conn *pgx.Conn
+type PgxStore struct{ q Querier }
+
+// Querier is everything this store needs in order to read the feed.
+//
+// An interface rather than *pgx.Conn, and not only for testability. The grants
+// are transaction-local, so a pull that read through a connection taken from the
+// pool would find no grants at all — the store has to be built over whatever
+// handle is inside the transaction that set them.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// NewPgxStore builds a store over a connection that already has the caller's
-// grants set.
-func NewPgxStore(conn *pgx.Conn) *PgxStore { return &PgxStore{conn: conn} }
+// NewPgxStore builds a store over a handle whose grants are already set.
+//
+// *pgx.Conn satisfies Querier, so a test can hand one directly.
+func NewPgxStore(q Querier) *PgxStore { return &PgxStore{q: q} }
 
 // LowestRetainedSeq reports the oldest row still in the feed.
 //
@@ -33,7 +43,7 @@ func (s *PgxStore) LowestRetainedSeq(ctx context.Context) (int64, error) {
 	// 1 when the feed is empty, so that a cursor of 0 is never mistaken for one
 	// that has fallen behind a feed that has since been filled.
 	var lowest int64 = 1
-	err := s.conn.QueryRow(ctx, `select coalesce(min(seq), 1) from change_feed`).Scan(&lowest)
+	err := s.q.QueryRow(ctx, `select coalesce(min(seq), 1) from change_feed`).Scan(&lowest)
 	if err != nil {
 		return 0, fmt.Errorf("pull: lowest retained seq: %w", err)
 	}
@@ -54,7 +64,7 @@ func (s *PgxStore) Page(ctx context.Context, cursor int64, limit int) ([]Change,
 	// One more than asked for, so has_more is answered by whether a row exists
 	// rather than by a second query. A second query would be a second answer to
 	// the same question, taken at a different moment.
-	rows, err := s.conn.Query(ctx, `
+	rows, err := s.q.Query(ctx, `
 		select seq, entity_type, entity_id, revision, changed_at, body
 		from change_feed
 		where seq > $1
