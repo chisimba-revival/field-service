@@ -1,3 +1,9 @@
 # Build output. Nothing generated belongs in the repository.
-field-service
+#
+# Anchored with a leading slash on purpose. Unanchored, this pattern matches any
+# path component named "field-service" — including the cmd/field-service
+# directory — so it did nothing here except hide main.go. That file assembles the
+# whole service and was never committed, while git status reported a clean tree,
+# because an ignored file is invisible to it.
+/field-service
 /dist/
