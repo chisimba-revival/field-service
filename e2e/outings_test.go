@@ -292,6 +292,53 @@ func TestAnUnknownKindIsRefusedRatherThanAttempted(t *testing.T) {
 	}
 }
 
+// The change feed carries an outing's own row, not a sighting's.
+//
+// This exists because of a defect the other tests could not see. The feed read
+// from sighting for every operation, so creating a hike found no sighting and the
+// no-row error poisoned the transaction — the client was told "commit
+// unexpectedly resulted in rollback" on a write that had succeeded, and would
+// have retried it for ever. Every other test here passed while that was true,
+// because none of them looked at the feed.
+//
+// Asserting the feed entity_type and that the body is the outing's own row is
+// what makes the choice of table visible. Asserting only that a feed row exists
+// would be satisfied by a sighting's body under an outing's name.
+func TestTheChangeFeedCarriesTheOutingsOwnRow(t *testing.T) {
+	r := start(t)
+	tok := r.token(0, "e2e-feed")
+
+	id := r.uuidFor("feed-hike")
+	op := r.anOuting("op-feed", id, "hike", map[string]any{
+		"rifle_role": "first", "walk_length_km": 7.5, "guide_id": "guide-1",
+	})
+	if status, body := r.push(tok, batch(op)); status != http.StatusOK {
+		t.Fatalf("status %d: %s", status, body)
+	}
+
+	var entityType string
+	var body map[string]any
+	err := r.pool.QueryRow(context.Background(),
+		`select entity_type, body from change_feed where entity_id = $1`, id).
+		Scan(&entityType, &body)
+	if err != nil {
+		t.Fatalf("no change-feed row for the outing: %v", err)
+	}
+	if entityType != "outing" {
+		t.Errorf("entity_type = %q, want %q", entityType, "outing")
+	}
+	if body["id"] != id {
+		t.Errorf("feed body carries id %v, want the outing's own %s — the feed read "+
+			"the wrong table", body["id"], id)
+	}
+	if _, isSighting := body["species_code"]; isSighting {
+		t.Error("the feed body is a sighting row, not an outing row")
+	}
+	if kind, _ := body["kind"].(string); kind != "hike" {
+		t.Errorf("feed body kind = %q, want %q", kind, "hike")
+	}
+}
+
 // A sighting hangs off an outing, so a hike's sighting is recorded the same way a
 // drive's is. Without this the whole change would be a new table nothing writes
 // to, and the sighting tests would pass against drives alone.

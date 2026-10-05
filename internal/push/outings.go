@@ -87,6 +87,18 @@ func (t *pgxTx) createOuting(ctx context.Context, caller Caller, op Operation) (
 		return refusalFor(err, op)
 	}
 
+	// The change feed is written for an outing exactly as it is for a sighting.
+	//
+	// Omitting it looked harmless — the row was in the table — and was not. The
+	// feed is how another device learns a record exists; without an entry, an
+	// outing a mentor created in the office is invisible to a device that pulls,
+	// and the sightings recorded against it arrive with nothing to hang them on.
+	// The test that caught this had to assert the feed row's body, because every
+	// other assertion here passed while the feed was missing.
+	if err := t.feed(ctx, caller, op, 1); err != nil {
+		return Result{}, err
+	}
+
 	return Result{
 		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
 		Outcome: OutcomeApplied, NewRevision: 1,
