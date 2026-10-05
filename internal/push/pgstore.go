@@ -430,9 +430,20 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 // stops being a consistent snapshot, and a client can receive two revisions of
 // one record in one page and apply them the wrong way round.
 func (t *pgxTx) feed(ctx context.Context, caller Caller, op Operation, revision int64) error {
+	// The table is chosen from the entity rather than assumed to be sighting.
+	//
+	// Reading sighting for every operation meant a create of anything else
+	// returned no row, and a no-row error inside a transaction poisons it: the
+	// failure surfaced as "commit unexpectedly resulted in rollback" on an
+	// operation that had been applied, which is the worst of both — a client told
+	// the write failed, retrying forever, against a row that was there all along.
+	table, ok := feedTables[op.Entity]
+	if !ok {
+		return fmt.Errorf("push: no change-feed table for entity %q", op.Entity)
+	}
 	var body []byte
 	if err := t.tx.QueryRow(ctx,
-		`select to_jsonb(s) from sighting s where s.id = $1`, op.EntityID,
+		`select to_jsonb(t) from `+table+` t where t.id = $1`, op.EntityID,
 	).Scan(&body); err != nil {
 		return err
 	}
@@ -441,6 +452,17 @@ func (t *pgxTx) feed(ctx context.Context, caller Caller, op Operation, revision 
 		 values ($1,$2,$3,$4,$5)`,
 		caller.WriteContext, op.Entity, op.EntityID, revision, body)
 	return err
+}
+
+// feedTables maps an entity to the table its change-feed body is read from.
+//
+// A map rather than a switch because the identifier is interpolated, and a
+// switch whose arms were all literals could be read as safe. Here the value is
+// only ever reached through this map, so an entity with no arm is an error
+// before anything is built, not a query against whatever the client named.
+var feedTables = map[string]string{
+	"sighting": "sighting",
+	"outing":   "outing",
 }
 
 func unsupported(op Operation, want string) Result {

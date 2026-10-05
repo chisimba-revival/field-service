@@ -63,11 +63,28 @@ func (t *pgxTx) createOuting(ctx context.Context, caller Caller, op Operation) (
 		return refuse(op, "camp_with_route"), nil
 	}
 
+	// Everything is validated before anything is written.
+	//
+	// Writing the outing first and validating as the detail was inserted left an
+	// outing behind every time a required field was missing: a hike with no rifle
+	// role was refused, the client was told so, and an outing with no
+	// hike_detail row sat in the table claiming to be a hike that never got its
+	// required field. Nothing in the response said so, and the refusal carried the
+	// client state as though nothing had been written.
+	//
+	// Validating first also keeps the validation and the insert in one place
+	// without a second pass to keep in step: checkOutingDetail is what both
+	// requireFields and insertOutingDetail read, so a field that becomes required
+	// later is enforced by adding it in one function rather than by remembering
+	// to update a check that has drifted away from the write.
+	if err := requireFields(op, kind); err != nil {
+		return refusalFor(err, op)
+	}
 	if err := t.insertOuting(ctx, caller, op, kind); err != nil {
-		return resultFor(err, op), nil
+		return refusalFor(err, op)
 	}
 	if err := t.insertOutingDetail(ctx, op, kind); err != nil {
-		return resultFor(err, op), nil
+		return refusalFor(err, op)
 	}
 
 	return Result{
@@ -101,7 +118,12 @@ func (t *pgxTx) insertOuting(ctx context.Context, caller Caller, op Operation, k
 	_, err := t.tx.Exec(ctx, q,
 		op.EntityID, caller.WriteContext, kind,
 		payloadText(op.Payload, "guide_id"),
-		payloadStrings(op.Payload, "trainee_ids"),
+		// An empty list rather than a nil slice when the client sent none.
+		// trainee_ids is not null with a default of '{}', and passing Go's nil
+		// writes NULL rather than falling back to the default — so an outing
+		// planned before the trainee list was known, which is ordinary, arrived
+		// as a constraint violation and poisoned the whole batch.
+		nonNilStrings(payloadStrings(op.Payload, "trainee_ids")),
 		status,
 		payloadTimePtr(op.Payload, "planned_start_time"),
 		payloadTimePtr(op.Payload, "start_time"),
@@ -129,13 +151,7 @@ func (t *pgxTx) insertOutingDetail(ctx context.Context, op Operation, kind strin
 	switch kind {
 	case "drive":
 		duration := payloadFloatPtr(op.Payload, "duration_hours")
-		if duration == nil || *duration <= 0 {
-			return missingField("drive_without_duration")
-		}
 		guests := payloadIntPtr(op.Payload, "guest_count")
-		if guests == nil || *guests < 0 {
-			return missingField("drive_without_guest_count")
-		}
 		_, err := t.tx.Exec(ctx,
 			`insert into drive_detail (outing_id, duration_hours, guest_count)
 			 values ($1, $2, $3)`,
@@ -144,17 +160,7 @@ func (t *pgxTx) insertOutingDetail(ctx context.Context, op Operation, kind strin
 
 	case "hike":
 		role := payloadText(op.Payload, "rifle_role")
-		if role != "first" && role != "second" && role != "neither" {
-			// One condition over three values rather than a presence check,
-			// because "neither" is a real answer and a blank is not. A participant
-			// who was on neither rifle is a fact the programme counts separately;
-			// a participant the client forgot about is a hole.
-			return missingField("hike_without_rifle_role")
-		}
 		length := payloadFloatPtr(op.Payload, "walk_length_km")
-		if length == nil || *length <= 0 {
-			return missingField("hike_without_walk_length")
-		}
 		_, err := t.tx.Exec(ctx,
 			`insert into hike_detail
 			   (outing_id, rifle_role, walk_length_km, hours_walked, description, lessons_learned)
@@ -166,9 +172,6 @@ func (t *pgxTx) insertOutingDetail(ctx context.Context, op Operation, kind strin
 		return err
 
 	case "camp":
-		// Nothing is required. A camp is a place and a duration and both are on
-		// the outing; the detail row exists so all three kinds are asked the same
-		// question, and so a camp can carry a site name when there is one.
 		_, err := t.tx.Exec(ctx,
 			`insert into camp_detail (outing_id, site_name, facilities)
 			 values ($1, $2, $3)`,
@@ -178,6 +181,43 @@ func (t *pgxTx) insertOutingDetail(ctx context.Context, op Operation, kind strin
 		return err
 	}
 	return missingField("unknown_outing_kind")
+}
+
+// requireFields checks the fields this kind of outing cannot do without.
+//
+// It reads nothing from the database and writes nothing, which is what lets it
+// run before any insert. Returning the same error type the insert path uses means
+// a refusal has one shape whichever check produced it.
+func requireFields(op Operation, kind string) error {
+	switch kind {
+	case "drive":
+		if d := payloadFloatPtr(op.Payload, "duration_hours"); d == nil || *d <= 0 {
+			return missingField("drive_without_duration")
+		}
+		if g := payloadIntPtr(op.Payload, "guest_count"); g == nil || *g < 0 {
+			return missingField("drive_without_guest_count")
+		}
+
+	case "hike":
+		// One condition over three values rather than a presence check, because
+		// "neither" is a real answer and a blank is not. A participant who was on
+		// neither rifle is a fact the programme counts separately; a participant
+		// the client forgot about is a hole.
+		switch role := payloadText(op.Payload, "rifle_role"); role {
+		case "first", "second", "neither":
+		default:
+			return missingField("hike_without_rifle_role")
+		}
+		if l := payloadFloatPtr(op.Payload, "walk_length_km"); l == nil || *l <= 0 {
+			return missingField("hike_without_walk_length")
+		}
+
+	case "camp":
+		// Nothing required. A camp is a place and a duration and both are on the
+		// outing; the detail row exists so all three kinds are asked the same
+		// question, and so a camp can carry a site name when there is one.
+	}
+	return nil
 }
 
 // missingField is a refusal carrying a code the client can act on.
@@ -190,17 +230,24 @@ type missingField string
 
 func (e missingField) Error() string { return "push: " + string(e) }
 
-// resultFor converts a refusal-worthy error into a Result.
+// refusalFor converts an error into either a refusal or a fault.
 //
-// Only missingField is converted. A database error stays an error, so a fault
-// fails the transaction and reaches the caller rather than being reported to the
-// client as though the client had done something wrong — the distinction being
-// exactly what lets an operator tell a bad request from a broken service.
-func resultFor(err error, op Operation) Result {
+// Only missingField becomes a refusal. Anything else is returned as an error, and
+// that is the distinction that lets an operator tell a bad request from a broken
+// service.
+//
+// The first version returned a zero Result for everything else. A database error
+// was therefore swallowed into a Result with no outcome, and the caller carried
+// on to commit a transaction the failed statement had already poisoned. What
+// reached the client was "commit unexpectedly resulted in rollback" on an
+// operation that had partly succeeded — a 500 telling it to retry a write that
+// had happened, which is the failure mode this file exists to avoid. An error
+// here is never a refusal, so the zero Result is gone rather than defaulted.
+func refusalFor(err error, op Operation) (Result, error) {
 	if code, ok := err.(missingField); ok {
-		return refuse(op, string(code))
+		return refuse(op, string(code)), nil
 	}
-	return Result{}
+	return Result{}, err
 }
 
 // refuse builds the refusal Result every check in this file returns. ClientState
@@ -241,6 +288,18 @@ func payloadStrings(m map[string]any, k string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// nonNilStrings makes an absent list into an empty one.
+//
+// The distinction is invisible in Go and decisive in SQL: a nil slice binds as
+// NULL and an empty slice binds as an empty array, and a column that is not null
+// with a default rejects the first and accepts the second.
+func nonNilStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
 }
 
 // payloadTimePtr reads a timestamp. A string is accepted and parsed, because JSON

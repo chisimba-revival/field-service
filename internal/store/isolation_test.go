@@ -44,8 +44,8 @@ const (
 )
 
 const (
-	driveNorth = "11111111-1111-1111-1111-111111111111"
-	driveSouth = "22222222-2222-2222-2222-222222222222"
+	outingNorth = "11111111-1111-1111-1111-111111111111"
+	outingSouth = "22222222-2222-2222-2222-222222222222"
 )
 
 func admin(t *testing.T) *pgx.Conn {
@@ -90,21 +90,21 @@ func seed(t *testing.T, conn *pgx.Conn) {
 	// trail_waypoint and media, which reference drive and sighting, so a
 	// bare truncate of the two original tables is refused. Found by running
 	// these tests after 0003, which is the only place it could be found.
-	if _, err := conn.Exec(ctx, `truncate drive, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
+	if _, err := conn.Exec(ctx, `truncate outing, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	for i, d := range []struct{ id, context, guide string }{
-		{driveNorth, ctxNorth, "guide-a"},
-		{driveSouth, ctxSouth, "guide-b"},
+		{outingNorth, ctxNorth, "guide-a"},
+		{outingSouth, ctxSouth, "guide-b"},
 	} {
 		if _, err := conn.Exec(ctx,
-			`insert into drive (id, context_code, guide_id, status)
+			`insert into outing (id, context_code, guide_id, status)
 			 values ($1, $2, $3, 'active')`,
 			d.id, d.context, d.guide); err != nil {
 			t.Fatalf("insert drive %s: %v", d.context, err)
 		}
 		if _, err := conn.Exec(ctx,
-			`insert into sighting (id, context_code, drive_id, location,
+			`insert into sighting (id, context_code, outing_id, location,
 			   captured_at, recorded_at, created_by, species_code)
 			 values ($1, $2, $3, st_setsrid(st_makepoint($4, $5), 4326),
 			         now(), now(), $6, 'LEOP')`,
@@ -326,11 +326,11 @@ func TestWritingIntoAnUngrantedContextIsRefused(t *testing.T) {
 			return
 		}
 		_, writeErr = tx.Exec(ctx,
-			`insert into sighting (id, context_code, drive_id, location,
+			`insert into sighting (id, context_code, outing_id, location,
 			   captured_at, recorded_at, created_by)
 			 values ('bbbbbbbb-0000-0000-0000-000000000001', $1, $2,
 			         st_setsrid(st_makepoint(36.9, -1.3), 4326),
-			         now(), now(), 'x')`, ctxSouth, driveSouth)
+			         now(), now(), 'x')`, ctxSouth, outingSouth)
 	})
 	if writeErr == nil {
 		t.Fatal("a write into an ungranted context succeeded. The context a record " +
@@ -379,11 +379,11 @@ func TestAnAbsentCountIsNotAZero(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := conn.Exec(ctx,
-				`insert into sighting (id, context_code, drive_id, location, count,
+				`insert into sighting (id, context_code, outing_id, location, count,
 				   captured_at, recorded_at, created_by)
 				 values (gen_random_uuid(), $1, $2,
 				         st_setsrid(st_makepoint(36.8, -1.2), 4326), $3,
-				         now(), now(), 'guide')`, ctxNorth, driveNorth, c.count)
+				         now(), now(), 'guide')`, ctxNorth, outingNorth, c.count)
 			if c.wantErr && err == nil {
 				t.Error("accepted. A zero asserts the animal was looked for and " +
 					"there were none, which is not the same as not having counted.")
@@ -400,11 +400,11 @@ func TestACorrectionWithoutAReasonIsRefused(t *testing.T) {
 	seed(t, conn)
 
 	_, err := conn.Exec(context.Background(),
-		`insert into sighting (id, context_code, drive_id, location, species_code,
+		`insert into sighting (id, context_code, outing_id, location, species_code,
 		   recorded_species_code, captured_at, recorded_at, created_by)
 		 values (gen_random_uuid(), $1, $2,
 		         st_setsrid(st_makepoint(36.8, -1.2), 4326), 'LION', 'LEOP',
-		         now(), now(), 'guide')`, ctxNorth, driveNorth)
+		         now(), now(), 'guide')`, ctxNorth, outingNorth)
 	if err == nil {
 		t.Fatal("a correction changing species code was accepted with no reason. " +
 			"Rule 15: a silent overwrite cannot be represented as a completed review.")

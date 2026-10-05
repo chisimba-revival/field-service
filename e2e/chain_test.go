@@ -157,7 +157,7 @@ func TestTheSameOperationTwiceIsOneRow(t *testing.T) {
 
 // TestOneBadOperationDoesNotLoseTheGoodOnes is the fourth fault, pinned.
 //
-// The contract says a batch is not all-or-nothing. A create with no drive_id sent
+// The contract says a batch is not all-or-nothing. A create with no outing_id sent
 // "" to a uuid column, the statement failed, and three good operations went with
 // it — every other client mistake is a refusal, so this one behaved differently
 // for no reason anybody chose.
@@ -167,7 +167,7 @@ func TestOneBadOperationDoesNotLoseTheGoodOnes(t *testing.T) {
 	var broken map[string]any
 	raw, _ := json.Marshal(r.sighting("e2e-partial"))
 	_ = json.Unmarshal(raw, &broken)
-	delete(broken["payload"].(map[string]any), "drive_id")
+	delete(broken["payload"].(map[string]any), "outing_id")
 
 	status, body := r.push(r.token(0, "e2e-partial"), batch(good, broken))
 	if status != http.StatusOK {
@@ -295,13 +295,13 @@ type pushResult struct {
 	ErrorCode   string `json:"error_code"`
 }
 
-// TestADriveOutsideTheCallersContextIsRefused covers the refusal that the
+// TestAnOutingOutsideTheCallersContextIsRefused covers the refusal that the
 // foreign key cannot make for us.
 //
 // Three things are asserted deliberately, and the middle one is the reason the
 // test exists at all.
 //
-// A drive that is not there is refused as a client mistake, not as a server
+// An outing that is not there is refused as a client mistake, not as a server
 // fault. It used to arrive as a 500, which is the one status that tells a client
 // nothing useful and takes a whole batch down with the operation that caused it.
 //
@@ -315,14 +315,14 @@ type pushResult struct {
 // into an oracle: a caller could walk the id space and learn which drives other
 // reserves have planned, which is what the grant set exists to withhold.
 //
-// A drive in the caller's own context still lands, so the refusal is not simply
+// An outing in the caller's own context still lands, so the refusal is not simply
 // refusing everything.
-func TestADriveOutsideTheCallersContextIsRefused(t *testing.T) {
+func TestAnOutingOutsideTheCallersContextIsRefused(t *testing.T) {
 	r := start(t)
 
-	t.Run("a drive that is not there", func(t *testing.T) {
+	t.Run("an outing that is not there", func(t *testing.T) {
 		op := r.sighting("e2e-nodrive")
-		op["payload"].(map[string]any)["drive_id"] = "00000000-0000-4000-8000-000000000000"
+		op["payload"].(map[string]any)["outing_id"] = "00000000-0000-4000-8000-000000000000"
 
 		status, body := r.push(r.token(0, "e2e-nodrive"), batch(op))
 		// The status is the point. A 500 would tell the client to retry, and a
@@ -334,8 +334,8 @@ func TestADriveOutsideTheCallersContextIsRefused(t *testing.T) {
 		if len(got) != 1 || got[0].Outcome != "refused" {
 			t.Fatalf("want one refused operation, got %s", body)
 		}
-		if got[0].ErrorCode != "unknown_drive" {
-			t.Errorf("error_code = %q, want unknown_drive: %s", got[0].ErrorCode, body)
+		if got[0].ErrorCode != "unknown_outing" {
+			t.Errorf("error_code = %q, want unknown_outing: %s", got[0].ErrorCode, body)
 		}
 		if n := r.countRows(t, op["entity_id"].(string)); n != 0 {
 			t.Errorf("%d rows written for a sighting on a drive that does not exist, want 0", n)
@@ -344,9 +344,9 @@ func TestADriveOutsideTheCallersContextIsRefused(t *testing.T) {
 
 	t.Run("a drive in another context", func(t *testing.T) {
 		// The drive genuinely exists, in a context this caller is not granted.
-		other := r.ensureDrive("e2e-other-context")
+		other := r.ensureOuting("e2e-other-context")
 		op := r.sighting("e2e-mine")
-		op["payload"].(map[string]any)["drive_id"] = other
+		op["payload"].(map[string]any)["outing_id"] = other
 
 		status, body := r.push(r.token(0, "e2e-mine"), batch(op))
 		if status != http.StatusOK {
@@ -357,7 +357,7 @@ func TestADriveOutsideTheCallersContextIsRefused(t *testing.T) {
 			t.Fatalf("want a refusal for a drive in another context, got %s", body)
 		}
 		if n := r.countRows(t, op["entity_id"].(string)); n != 0 {
-			t.Errorf("%d rows written against another context's drive, want 0", n)
+			t.Errorf("%d rows written against another context's outing, want 0", n)
 		}
 	})
 

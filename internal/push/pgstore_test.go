@@ -30,7 +30,7 @@ const (
 	ctxNorth = "north-reserve"
 	ctxSouth = "south-reserve"
 
-	driveNorth = "11111111-1111-1111-1111-111111111111"
+	outingNorth = "11111111-1111-1111-1111-111111111111"
 )
 
 // admin connects as the migration role to arrange fixtures. It may assume the
@@ -76,19 +76,19 @@ func asRuntime(t *testing.T, grants string, fn func(context.Context, *pgx.Conn))
 func reset(t *testing.T, conn *pgx.Conn) {
 	t.Helper()
 	_, err := conn.Exec(context.Background(),
-		`truncate change_feed, operation_outcome, media, trail_waypoint, trail_log, sighting, drive cascade`)
+		`truncate change_feed, operation_outcome, media, trail_waypoint, trail_log, sighting, outing, drive_detail, hike_detail, camp_detail cascade`)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 }
 
-func seedDrive(t *testing.T, conn *pgx.Conn, id, ctxCode string) {
+func seedOuting(t *testing.T, conn *pgx.Conn, id, ctxCode string) {
 	t.Helper()
 	_, err := conn.Exec(context.Background(),
-		`insert into drive (id, context_code, guide_id, status) values ($1,$2,'guide-1','active')
+		`insert into outing (id, context_code, guide_id, status) values ($1,$2,'guide-1','active')
 		 on conflict (id) do nothing`, id, ctxCode)
 	if err != nil {
-		t.Fatalf("seeding drive: %v", err)
+		t.Fatalf("seeding outing: %v", err)
 	}
 }
 
@@ -150,7 +150,7 @@ func aCreate(id, drive, species string, count int) push.Operation {
 		EntityID:    uuidFor(id),
 		CapturedAt:  time.Date(2026, 10, 4, 6, 14, 0, 0, time.UTC),
 		Payload: map[string]any{
-			"drive_id": drive, "species_code": species, "count": count,
+			"outing_id": drive, "species_code": species, "count": count,
 			"longitude": 36.8219, "latitude": -1.2921, "notes": "moving east",
 		},
 	}
@@ -163,10 +163,10 @@ func northCaller() push.Caller { return push.Caller{ID: "user-1", WriteContext: 
 func TestACreateIsAppliedIntoTheCallersContext(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, conn := service(t, ctxNorth)
-	op := aCreate("op-create-1", driveNorth, "LEOP", 2)
+	op := aCreate("op-create-1", outingNorth, "LEOP", 2)
 
 	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{op})
 	if err != nil {
@@ -198,11 +198,11 @@ func TestACreateIsAppliedIntoTheCallersContext(t *testing.T) {
 func TestACreateCannotBeDirectedIntoAnotherContextByItsPayload(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
-	seedDrive(t, adm, "22222222-2222-2222-2222-222222222222", ctxSouth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
+	seedOuting(t, adm, "22222222-2222-2222-2222-222222222222", ctxSouth)
 
 	svc, conn := service(t, ctxNorth)
-	op := aCreate("op-ctx-1", driveNorth, "LEOP", 1)
+	op := aCreate("op-ctx-1", outingNorth, "LEOP", 1)
 	// Every field a client might try to smuggle a context through.
 	op.Payload["context_code"] = ctxSouth
 	op.Payload["contextCode"] = ctxSouth
@@ -228,10 +228,10 @@ func TestACreateCannotBeDirectedIntoAnotherContextByItsPayload(t *testing.T) {
 func TestACreateWritesAChangeFeedEntryCarryingTheRow(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, _ := service(t, ctxNorth)
-	op := aCreate("op-feed-1", driveNorth, "LEOP", 2)
+	op := aCreate("op-feed-1", outingNorth, "LEOP", 2)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{op}); err != nil {
 		t.Fatal(err)
 	}
@@ -255,10 +255,10 @@ func TestACreateWritesAChangeFeedEntryCarryingTheRow(t *testing.T) {
 func TestARetryOfACreateIsAppliedExactlyOnce(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, conn := service(t, ctxNorth)
-	op := aCreate("op-retry-1", driveNorth, "LEOP", 2)
+	op := aCreate("op-retry-1", outingNorth, "LEOP", 2)
 
 	first, err := svc.Push(context.Background(), northCaller(), []push.Operation{op})
 	if err != nil {
@@ -290,12 +290,12 @@ func TestARetryOfACreateIsAppliedExactlyOnce(t *testing.T) {
 func TestTheEntityChangeAndItsOutcomeCommitTogetherOrNotAtAll(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, conn := service(t, ctxNorth)
 
 	// Make the outcome write fail after the sighting has been inserted.
-	atomicOp := aCreate("op-atomic-1", driveNorth, "LEOP", 1)
+	atomicOp := aCreate("op-atomic-1", outingNorth, "LEOP", 1)
 	if _, err := adm.Exec(context.Background(), "alter table operation_outcome rename to operation_outcome_hidden"); err != nil {
 		t.Skipf("cannot rename: %v", err)
 	}
@@ -329,10 +329,10 @@ func TestTheEntityChangeAndItsOutcomeCommitTogetherOrNotAtAll(t *testing.T) {
 func TestACorrectionChangingACountWithoutAReasonIsRefused(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, _ := service(t, ctxNorth)
-	create := aCreate("op-c-1", driveNorth, "LEOP", 7)
+	create := aCreate("op-c-1", outingNorth, "LEOP", 7)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
 		t.Fatal(err)
 	}
@@ -361,10 +361,10 @@ func TestACorrectionChangingACountWithoutAReasonIsRefused(t *testing.T) {
 func TestACorrectionRetainsTheOriginalClaimBesideTheCorrection(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, conn := service(t, ctxNorth)
-	create := aCreate("op-c-2", driveNorth, "LEOP", 7)
+	create := aCreate("op-c-2", outingNorth, "LEOP", 7)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
 		t.Fatal(err)
 	}
@@ -415,10 +415,10 @@ func TestACorrectionRetainsTheOriginalClaimBesideTheCorrection(t *testing.T) {
 func TestACorrectionAgainstAStaleRevisionIsRefusedWithBothSidesKept(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, _ := service(t, ctxNorth)
-	create := aCreate("op-c-3", driveNorth, "LEOP", 2)
+	create := aCreate("op-c-3", outingNorth, "LEOP", 2)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
 		t.Fatal(err)
 	}
@@ -491,10 +491,10 @@ func TestACorrectionOfAnAbsentRecordIsRefusedRatherThanCreated(t *testing.T) {
 func TestACreateCarryingABaseRevisionIsRefused(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, _ := service(t, ctxNorth)
-	op := aCreate("op-create-rev", driveNorth, "LEOP", 1)
+	op := aCreate("op-create-rev", outingNorth, "LEOP", 1)
 	rev := int64(4)
 	op.BaseRevision = &rev
 
@@ -536,10 +536,10 @@ func TestAnUnknownKindIsRefusedRatherThanDeferredForever(t *testing.T) {
 func TestTheChangeFeedHidesRowsFromContextsTheCallerWasNotGranted(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxSouth)
+	seedOuting(t, adm, outingNorth, ctxSouth)
 
 	svc, _ := service(t, ctxNorth) // granted north, writing into north
-	op := aCreate("op-iso-1", driveNorth, "LEOP", 1)
+	op := aCreate("op-iso-1", outingNorth, "LEOP", 1)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{op}); err != nil {
 		t.Fatal(err)
 	}
@@ -564,16 +564,16 @@ func TestTheChangeFeedHidesRowsFromContextsTheCallerWasNotGranted(t *testing.T) 
 func TestARefusalInABatchDoesNotUndoTheOthers(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, conn := service(t, ctxNorth)
-	good := aCreate("op-batch-1", driveNorth, "LEOP", 1)
+	good := aCreate("op-batch-1", outingNorth, "LEOP", 1)
 	ghost := push.Operation{
 		OperationID: uuidFor("op-batch-ghost"), Entity: "sighting", Kind: "correct",
 		EntityID: uuidFor("ghost"), BaseRevision: ptr(int64(1)),
 		Payload: map[string]any{"count": 4, "correction_reason": "x"},
 	}
-	later := aCreate("op-batch-2", driveNorth, "LION", 1)
+	later := aCreate("op-batch-2", outingNorth, "LION", 1)
 
 	got, err := svc.Push(context.Background(), northCaller(),
 		[]push.Operation{good, ghost, later})
@@ -600,10 +600,10 @@ func TestARefusalInABatchDoesNotUndoTheOthers(t *testing.T) {
 func TestASparseCorrectionLeavesUnmentionedFieldsAlone(t *testing.T) {
 	adm := admin(t)
 	reset(t, adm)
-	seedDrive(t, adm, driveNorth, ctxNorth)
+	seedOuting(t, adm, outingNorth, ctxNorth)
 
 	svc, conn := service(t, ctxNorth)
-	create := aCreate("op-sparse-1", driveNorth, "LEOP", 5)
+	create := aCreate("op-sparse-1", outingNorth, "LEOP", 5)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +670,7 @@ func TestMain(m *testing.M) {
 
 // A payload missing a field it must carry is refused, not attempted.
 //
-// Found by sending a real HTTP request with no drive_id: it reached the insert
+// Found by sending a real HTTP request with no outing_id: it reached the insert
 // as the empty string, the database refused it with a type error, and the whole
 // batch came back as a 500. Every other client mistake here is a refusal, so the
 // inconsistency mattered as much as the fault — and one bad operation taking
@@ -678,10 +678,10 @@ func TestMain(m *testing.M) {
 func TestACreateMissingItsDriveIsRefusedRatherThanFailingTheBatch(t *testing.T) {
 	svc, conn := service(t, ctxNorth)
 	defer func() { _ = conn.Close(context.Background()) }()
-	seedDrive(t, conn, driveNorth, ctxNorth)
+	seedOuting(t, conn, outingNorth, ctxNorth)
 
-	op := aCreate("op-no-drive", driveNorth, "LEOP", 2)
-	delete(op.Payload, "drive_id")
+	op := aCreate("op-no-drive", outingNorth, "LEOP", 2)
+	delete(op.Payload, "outing_id")
 
 	got, err := svc.Push(context.Background(),
 		push.Caller{ID: "user-1", WriteContext: ctxNorth}, []push.Operation{op})
@@ -691,7 +691,7 @@ func TestACreateMissingItsDriveIsRefusedRatherThanFailingTheBatch(t *testing.T) 
 	if got[0].Outcome != push.OutcomeRefused {
 		t.Errorf("outcome %q, want refused", got[0].Outcome)
 	}
-	if got[0].ErrorCode != "create_without_drive_id" {
+	if got[0].ErrorCode != "create_without_outing_id" {
 		t.Errorf("code %q", got[0].ErrorCode)
 	}
 }
@@ -700,11 +700,11 @@ func TestACreateMissingItsDriveIsRefusedRatherThanFailingTheBatch(t *testing.T) 
 func TestAGoodOperationInTheSameBatchStillLands(t *testing.T) {
 	svc, conn := service(t, ctxNorth)
 	defer func() { _ = conn.Close(context.Background()) }()
-	seedDrive(t, conn, driveNorth, ctxNorth)
+	seedOuting(t, conn, outingNorth, ctxNorth)
 
-	bad := aCreate("op-no-drive", driveNorth, "LEOP", 2)
-	delete(bad.Payload, "drive_id")
-	good := aCreate("op-fine", driveNorth, "LION", 1)
+	bad := aCreate("op-no-drive", outingNorth, "LEOP", 2)
+	delete(bad.Payload, "outing_id")
+	good := aCreate("op-fine", outingNorth, "LION", 1)
 
 	got, err := svc.Push(context.Background(),
 		push.Caller{ID: "user-1", WriteContext: ctxNorth},
@@ -731,14 +731,14 @@ func TestAGoodOperationInTheSameBatchStillLands(t *testing.T) {
 func TestCapturedAndRecordedTimesAreNotTheSameFact(t *testing.T) {
 	svc, conn := service(t, ctxNorth)
 	defer func() { _ = conn.Close(context.Background()) }()
-	seedDrive(t, conn, driveNorth, ctxNorth)
+	seedOuting(t, conn, outingNorth, ctxNorth)
 
-	driveID := driveNorth
+	driveID := outingNorth
 	captured := time.Date(2026, 10, 4, 6, 14, 0, 0, time.UTC) // dawn
 	written := time.Date(2026, 10, 4, 19, 40, 0, 0, time.UTC) // written up that evening
 
 	op := aCreate("op-two-times", driveID, "LEOP", 1)
-	op.Payload["drive_id"] = driveID
+	op.Payload["outing_id"] = driveID
 	op.CapturedAt = captured
 	op.RecordedAt = written
 

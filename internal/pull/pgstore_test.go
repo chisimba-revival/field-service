@@ -108,7 +108,7 @@ func reset(t *testing.T, conn *pgx.Conn) {
 	// in parallel. The advisory lock in TestMain serialises them; this clears the
 	// fixtures the last one left.
 	if _, err := conn.Exec(context.Background(),
-		`truncate change_feed, operation_outcome, media, trail_waypoint, trail_log, sighting, drive cascade`); err != nil {
+		`truncate change_feed, operation_outcome, media, trail_waypoint, trail_log, sighting, outing, drive_detail, hike_detail, camp_detail cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 }

@@ -27,21 +27,21 @@ func seedSync(t *testing.T, conn *pgx.Conn) {
 	ctx := context.Background()
 	// Every table, with cascade: trail_log, trail_waypoint and media reference
 	// drive and sighting, so truncating a subset is refused outright.
-	if _, err := conn.Exec(ctx, `truncate drive, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
+	if _, err := conn.Exec(ctx, `truncate outing, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	// rifle_role, not a trail code: second-rifle hours are counted separately
 	// from first-rifle and from a participant's own, and merging them is the one
 	// thing this column exists to prevent.
 	// The drives are re-inserted here because the truncate above clears them and
-	// trail_log.drive_id is a foreign key. A trail log belongs to a drive, so a
+	// trail_log.outing_id is a foreign key. A trail log belongs to a drive, so a
 	// trail fixture without one is not a smaller fixture, it is an invalid one.
 	for _, d := range []struct{ id, ctxCode, guide string }{
-		{driveNorth, ctxNorth, "guide-a"},
-		{driveSouth, ctxSouth, "guide-b"},
+		{outingNorth, ctxNorth, "guide-a"},
+		{outingSouth, ctxSouth, "guide-b"},
 	} {
 		if _, err := conn.Exec(ctx,
-			`insert into drive (id, context_code, guide_id, status)
+			`insert into outing (id, context_code, guide_id, status)
 			 values ($1, $2, $3, 'active')`,
 			d.id, d.ctxCode, d.guide); err != nil {
 			t.Fatalf("insert drive %s: %v", d.ctxCode, err)
@@ -49,11 +49,11 @@ func seedSync(t *testing.T, conn *pgx.Conn) {
 	}
 
 	for _, l := range []struct{ id, drive, ctxCode, role string }{
-		{logNorth, driveNorth, ctxNorth, "first"},
-		{logSouth, driveSouth, ctxSouth, "second"},
+		{logNorth, outingNorth, ctxNorth, "first"},
+		{logSouth, outingSouth, ctxSouth, "second"},
 	} {
 		if _, err := conn.Exec(ctx,
-			`insert into trail_log (id, context_code, drive_id, started_at, rifle_role, created_by)
+			`insert into trail_log (id, context_code, outing_id, started_at, rifle_role, created_by)
 			 values ($1, $2, $3, now(), $4, 'guide')`,
 			l.id, l.ctxCode, l.drive, l.role); err != nil {
 			t.Fatalf("insert trail_log %s: %v", l.ctxCode, err)
@@ -136,11 +136,11 @@ func TestEveryContextBearingTableIsIsolated(t *testing.T) {
 				// sighting_id is a real foreign key, so the parent row has to
 				// exist rather than being a generated uuid.
 				for _, m := range []struct{ ctxCode, parent, drive string }{
-					{ctxNorth, sightNorth, driveNorth},
-					{ctxSouth, sightSouth, driveSouth},
+					{ctxNorth, sightNorth, outingNorth},
+					{ctxSouth, sightSouth, outingSouth},
 				} {
 					if _, err := conn.Exec(context.Background(),
-						`insert into sighting (id, context_code, drive_id, location,
+						`insert into sighting (id, context_code, outing_id, location,
 						   captured_at, recorded_at, created_by)
 						 values ($1, $2, $3, st_setsrid(st_makepoint(36.8, -1.2), 4326),
 						         now(), now(), 'guide')`,
@@ -148,7 +148,7 @@ func TestEveryContextBearingTableIsIsolated(t *testing.T) {
 						t.Fatalf("insert parent sighting: %v", err)
 					}
 					if _, err := conn.Exec(context.Background(),
-						`insert into media (id, context_code, drive_id, kind, filename,
+						`insert into media (id, context_code, outing_id, kind, filename,
 						   mime_type, size_bytes, captured_at, state, sighting_id)
 						 values (gen_random_uuid(), $1, $2, 'photo', 'a.jpg',
 						         'image/jpeg', 10, now(), 'pending', $3)`,
@@ -285,12 +285,12 @@ func TestMediaHasExactlyOneParent(t *testing.T) {
 	conn := admin(t)
 	ctx := context.Background()
 	if _, err := conn.Exec(ctx,
-		`insert into sighting (id, context_code, drive_id, location, captured_at, recorded_at, created_by)
+		`insert into sighting (id, context_code, outing_id, location, captured_at, recorded_at, created_by)
 		 values ($1, $2, $3, st_setsrid(st_makepoint(36.8, -1.2), 4326), now(), now(), 'guide')`,
-		sightNorth, ctxNorth, driveNorth); err != nil {
+		sightNorth, ctxNorth, outingNorth); err != nil {
 		t.Fatal(err)
 	}
-	insert := `insert into media (id, context_code, drive_id, kind, filename,
+	insert := `insert into media (id, context_code, outing_id, kind, filename,
 	           mime_type, size_bytes, captured_at, state, sighting_id, trail_log_id)
 	           values (gen_random_uuid(), $1, $2, 'photo', 'a.jpg', 'image/jpeg',
 	                   10, now(), 'pending', $3, $4)`
@@ -308,7 +308,7 @@ func TestMediaHasExactlyOneParent(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := conn.Exec(ctx, insert, ctxNorth, driveNorth, c.sight, c.log)
+			_, err := conn.Exec(ctx, insert, ctxNorth, outingNorth, c.sight, c.log)
 			if c.wantErr && err == nil {
 				t.Error("accepted. Exactly one applies; two parents is ambiguous " +
 					"and none is a record pointing at nothing.")
@@ -430,18 +430,18 @@ func TestTrailLogFieldRules(t *testing.T) {
 		sql  string
 	}{
 		{"a merged rifle role",
-			`insert into trail_log (id, context_code, drive_id, started_at, created_by, rifle_role)
+			`insert into trail_log (id, context_code, outing_id, started_at, created_by, rifle_role)
 			 values (gen_random_uuid(), $1, $2, now(), 'g', 'first_and_second')`},
 		{"an ended log that ends before it starts",
-			`insert into trail_log (id, context_code, drive_id, started_at, ended_at, created_by)
+			`insert into trail_log (id, context_code, outing_id, started_at, ended_at, created_by)
 			 values (gen_random_uuid(), $1, $2, now() + interval '1 hour', now(), 'g')`},
 		{"a lesson that says nothing",
-			`insert into trail_log (id, context_code, drive_id, started_at, created_by, lessons_learned)
+			`insert into trail_log (id, context_code, outing_id, started_at, created_by, lessons_learned)
 			 values (gen_random_uuid(), $1, $2, now(), 'g', '   ')`},
 	}
 	for _, b := range bad {
 		t.Run(b.name, func(t *testing.T) {
-			if _, err := conn.Exec(ctx, b.sql, ctxNorth, driveNorth); err == nil {
+			if _, err := conn.Exec(ctx, b.sql, ctxNorth, outingNorth); err == nil {
 				t.Error("accepted")
 			}
 		})
@@ -510,8 +510,8 @@ func TestIsolationViolationsAreRefusalsNotErrors(t *testing.T) {
 			return
 		}
 		_, writeErr = tx.Exec(ctx,
-			`insert into trail_log (id, context_code, drive_id, started_at, created_by)
-			 values (gen_random_uuid(), $1, $2, now(), 'g')`, ctxSouth, driveNorth)
+			`insert into trail_log (id, context_code, outing_id, started_at, created_by)
+			 values (gen_random_uuid(), $1, $2, now(), 'g')`, ctxSouth, outingNorth)
 	})
 	if writeErr == nil {
 		t.Fatal("a write into an ungranted context succeeded")

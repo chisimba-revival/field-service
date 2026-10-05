@@ -75,7 +75,7 @@ func searchCatalogue(t *testing.T, r *rig, tok, term string) []string {
 // offline cache of species it cannot fetch.
 func TestTheWholeCatalogueIsServedBehindTheGuard(t *testing.T) {
 	r := start(t)
-	tok := r.token(0, r.ensureDrive("Alpha"))
+	tok := r.token(0, r.ensureOuting("Alpha"))
 
 	if code, _ := r.catalogueGET("", "/api/v1/species"); code == http.StatusOK {
 		t.Fatal("the catalogue was served without a token")
@@ -100,7 +100,7 @@ func TestTheWholeCatalogueIsServedBehindTheGuard(t *testing.T) {
 // most likely to use: the code is printed on the sighting they are looking at.
 func TestTheCatalogueIsSearchableByCode(t *testing.T) {
 	r := start(t)
-	tok := r.token(0, r.ensureDrive("Alpha"))
+	tok := r.token(0, r.ensureOuting("Alpha"))
 
 	all := searchCatalogue(t, r, tok, "")
 	if len(all) < 5 {
@@ -139,7 +139,7 @@ func TestTheCatalogueIsSearchableByCode(t *testing.T) {
 // apart is a test of neither.
 func TestASearchWildcardIsEscapedNotHonoured(t *testing.T) {
 	r := start(t)
-	tok := r.token(0, r.ensureDrive("Alpha"))
+	tok := r.token(0, r.ensureOuting("Alpha"))
 
 	total := len(searchCatalogue(t, r, tok, ""))
 	if total == 0 {
@@ -162,7 +162,7 @@ func TestASearchWildcardIsEscapedNotHonoured(t *testing.T) {
 // to want the white rhino as one typing "rhino".
 func TestTheCatalogueIsSearchableByDescription(t *testing.T) {
 	r := start(t)
-	tok := r.token(0, r.ensureDrive("Alpha"))
+	tok := r.token(0, r.ensureOuting("Alpha"))
 
 	got := searchCatalogue(t, r, tok, "grazing")
 	if len(got) != 1 || got[0] != "WHRI" {
@@ -176,7 +176,7 @@ func TestTheCatalogueIsSearchableByDescription(t *testing.T) {
 // covered here too: a client that cached "leop" must get the leopard, not a 404.
 func TestASingleSpeciesIsServedAndAnAbsentCodeIsNotFound(t *testing.T) {
 	r := start(t)
-	tok := r.token(0, r.ensureDrive("Alpha"))
+	tok := r.token(0, r.ensureOuting("Alpha"))
 
 	code, body := r.catalogueGET(tok, "/api/v1/species/leop")
 	if code != http.StatusOK {

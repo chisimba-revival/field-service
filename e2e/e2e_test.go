@@ -356,7 +356,7 @@ func (r *rig) do(req *http.Request) (int, []byte) {
 // them. Flattening them is the mistake this harness made first, and it was
 // caught by DisallowUnknownFields — a refusal with a message about field names,
 // for a body that looked perfectly reasonable.
-// ensureDrive provisions a drive in a context and returns its id.
+// ensureOuting provisions a drive in a context and returns its id.
 //
 // The sighting's drive is a foreign key, so a batch naming a drive that does not
 // exist is refused by PostgreSQL rather than by this service — and that refusal
@@ -364,11 +364,11 @@ func (r *rig) do(req *http.Request) (int, []byte) {
 // produced. Provisioning here keeps it out of the tests that are about
 // something else, and keeps the fixture honest: a real drive in the real context,
 // rather than a drive borrowed from another one.
-func (r *rig) ensureDrive(ctx string) string {
+func (r *rig) ensureOuting(ctx string) string {
 	r.t.Helper()
-	// Derived from the context, so the same context always gets the same drive
+	// Derived from the context, so the same context always gets the same outing
 	// and repeated runs do not accumulate rows.
-	sum := sha256.Sum256([]byte("drive:" + ctx))
+	sum := sha256.Sum256([]byte("outing:" + ctx))
 	h := hex(sum[:16])
 	// The version and variant nibbles are overwritten in place rather than
 	// skipped. Slicing around them instead drops a character, and a uuid one
@@ -377,10 +377,10 @@ func (r *rig) ensureDrive(ctx string) string {
 	h = h[:12] + "4" + h[13:16] + "8" + h[17:]
 	id := h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 	_, err := r.pool.Exec(context.Background(),
-		`insert into drive (id, context_code, guide_id) values ($1, $2, 'guide-1')
+		`insert into outing (id, context_code, guide_id) values ($1, $2, 'guide-1')
 		 on conflict (id) do nothing`, id, ctx)
 	if err != nil {
-		r.t.Fatalf("provisioning a drive in %s: %v", ctx, err)
+		r.t.Fatalf("provisioning an outing in %s: %v", ctx, err)
 	}
 	return id
 }
@@ -395,7 +395,7 @@ func (r *rig) sighting(ctx string) map[string]any {
 		"captured_at":   "2026-10-05T06:14:00Z",
 		"recorded_at":   "2026-10-05T18:02:00Z",
 		"payload": map[string]any{
-			"drive_id":     r.ensureDrive(ctx),
+			"outing_id":    r.ensureOuting(ctx),
 			"species_code": "LEOP",
 			"count":        2,
 			"notes":        "two males moving east",
