@@ -28,7 +28,7 @@ const MaxBodyBytes = 4 << 20 // 4 MiB
 
 // Sync holds what the sync routes need.
 type Sync struct {
-	Push *push.Service
+	Push PushService
 	// Pull answers a pull for a caller. It is a function rather than a service
 	// because a pull must be bound to the transaction carrying the caller's
 	// grants: those settings are transaction-local, so a service built once over
@@ -41,6 +41,19 @@ type Sync struct {
 	// is told a sentence and the operator is told the reason, and the second half
 	// is what makes the first half safe to give away.
 	Log Logger
+}
+
+// PushService applies a batch.
+//
+// An interface, not the concrete service, and the reason is a test that was
+// quietly measuring nothing. The single most important thing this file decides is
+// where a write's context comes from: the token, never the request. With a
+// concrete *push.Service there was no way to observe the Caller the handler
+// built, so the only test available built one itself — which proves the test's
+// copy of the decision correct and leaves the real one unguarded. Falsifying it
+// by reading the context out of the body produced zero failures.
+type PushService interface {
+	Push(ctx context.Context, caller push.Caller, ops []push.Operation) ([]push.Result, error)
 }
 
 // NewSyncRoutes builds the two sync routes, each already wrapped in the guard.

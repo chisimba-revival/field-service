@@ -54,7 +54,7 @@ func (aWorkingSession) Querier(ctx context.Context, _ string, _ []string, fn fun
 
 // aRoutes builds the router with a push service that must never be reached, so
 // any test that passes proves the guard stopped the request first.
-func aRoutes(pusher *push.Service, puller func(context.Context, string, string, Querier) (pull.Page, error)) http.Handler {
+func aRoutes(pusher PushService, puller func(context.Context, string, string, Querier) (pull.Page, error)) http.Handler {
 	v := &fakeVerifier{principal: goodToken()}
 	g := NewGuard(v, allowChecker{}, aWorkingSession{}, &quietLog{}, goodScope)
 	return NewSyncRoutes(g, &Sync{Push: pusher, Pull: puller, Session: aWorkingSession{}, Log: &quietLog{}})
@@ -183,24 +183,37 @@ func TestAnUnknownFieldIsRefusedAtTheBoundary(t *testing.T) {
 	}
 }
 
-// The write context is the token's active context, so nothing in the body can
+// recordingPush captures the Caller the real handler built.
+type recordingPush struct{ seen push.Caller }
+
+func (r *recordingPush) Push(_ context.Context, caller push.Caller, _ []push.Operation) ([]push.Result, error) {
+	r.seen = caller
+	return []push.Result{{OperationID: "x", Outcome: push.OutcomeApplied}}, nil
+}
+
+// The write context is the token's active context, and nothing in the body can
 // redirect a write.
+//
+// This drives the real route and observes the Caller the real handler built. The
+// first version of this test used a probe handler that constructed the Caller
+// itself, which proved the probe correct and left the handler unguarded — reading
+// the context out of the body in the handler produced zero test failures. The
+// service is an interface now so this can be observed at all.
 func TestTheWriteContextCannotBeSuppliedByTheBody(t *testing.T) {
-	var seen push.Caller
-	g := NewGuard(&fakeVerifier{principal: goodToken()}, allowChecker{}, aWorkingSession{}, &quietLog{}, goodScope)
-	h := g.Serve(func(w http.ResponseWriter, r *http.Request, c Caller) error {
-		seen = push.Caller{ID: c.Subject(), WriteContext: c.ActiveContext()}
-		return problem(w, http.StatusOK, "reached", "reached")
-	})
+	pusher := &recordingPush{}
+	h := aRoutes(pusher, nil)
 
 	body := `{"operations":[{"operation_id":"x","entity":"sighting","kind":"create","entity_id":"e",
-	"context_code":"south-reserve","contextCode":"south-reserve","ctx":"south-reserve"}]}`
+	"payload":{"context_code":"south-reserve","contextCode":"south-reserve","ctx":"south-reserve"}}]}`
 	if got := post(h, "/api/v1/sync/push", body); got.Code != http.StatusOK {
-		t.Fatalf("%d, want 200 from the probe handler", got.Code)
+		t.Fatalf("%d, want 200: %s", got.Code, got.Body.String())
 	}
-	if seen.WriteContext != "north-reserve" {
+	if pusher.seen.WriteContext != "north-reserve" {
 		t.Errorf("write context %q. The token says north-reserve and the body "+
-			"asked for south-reserve three different ways.", seen.WriteContext)
+			"asked for south-reserve three different ways.", pusher.seen.WriteContext)
+	}
+	if pusher.seen.ID != "user-1" {
+		t.Errorf("caller id %q; rule 2 says the Chisimba id unchanged", pusher.seen.ID)
 	}
 }
 
