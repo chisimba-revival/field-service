@@ -46,7 +46,17 @@ var ErrRejected = errors.New("token rejected")
 // where a new record is written. Grants is what reads are checked against.
 // Neither is derived from the other.
 type Claims struct {
-	Subject       string   `json:"sub"`
+	Subject string `json:"sub"`
+
+	// Type says what the token is for: Chisimba issues "access" for a person and
+	// "service" for one acting for the platform rather than for a user.
+	//
+	// It is read but never inferred. A token with no type is a token whose type
+	// this service does not know, and treating an absent claim as the ordinary
+	// case would let a service token be treated as a person's — which is the one
+	// mistake that must not be made quietly, because a service token has no user
+	// behind it and every decision made on that assumption is unfounded.
+	Type          string   `json:"type"`
 	Scope         []string `json:"scope"`
 	ActiveContext string   `json:"ctx"`
 	Grants        []string `json:"ctxs"`

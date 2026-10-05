@@ -36,6 +36,7 @@ import (
 // means these tests need no RSA keys to run.
 type Principal interface {
 	Subject() string
+	TokenType() string
 	Scopes() []string
 	ActiveContext() string
 	Grants() []string
@@ -50,6 +51,15 @@ type Principal interface {
 // the raw claims through a named field and cannot shadow a method with its own
 // idea of one.
 type Caller struct{ Principal }
+
+// IsService reports whether this caller is a platform service rather than a
+// person.
+//
+// Only an exact "service" counts. A token with no type claim, or with a type this
+// service has never heard of, is a person's token for the purpose of every check
+// here — because a person is what every existing rule is written about, and an
+// unrecognised claim is not evidence of anything.
+func (c Caller) IsService() bool { return c.Principal.TokenType() == "service" }
 
 // Verifier checks a bearer token's signature and claims.
 //
@@ -125,6 +135,15 @@ type Logger interface {
 // error. See problem() in sync_routes.go for what went wrong without it.
 var ErrAnswered = errors.New("httpapi: response already written")
 
+// ServiceHandler is what a service route does once the caller is known.
+//
+// It is a separate named type from Handler so the two doors are not wired to each
+// other by accident, and it takes the same arguments deliberately: the safety does
+// not come from the signature, it comes from Serve refusing a service token and
+// ServeService refusing a person's, so a mix-up fails closed at runtime even
+// though the compiler cannot see it.
+type ServiceHandler func(w http.ResponseWriter, r *http.Request, c Caller) error
+
 // Handler is what a route does once the caller is known.
 //
 // It cannot be called without a Caller, which is the point: the signature is the
@@ -137,14 +156,20 @@ type Handler func(w http.ResponseWriter, r *http.Request, c Caller) error
 // token at all rather than as its own reason. It is the same outcome for the
 // caller, and one fewer thing to distinguish.
 const (
-	reasonNoHeader      = "no bearer token presented"
-	reasonInvalid       = "token did not validate"
-	reasonNoSubject     = "token carries no subject"
-	reasonRevoked       = "token is on the denylist"
-	reasonDenylistDown  = "denylist could not be read"
-	reasonScope         = "token does not carry the required scope"
-	reasonNoGrants      = "token carries no context grants"
-	reasonHandlerFailed = "handler failed"
+	reasonNoHeader     = "no bearer token presented"
+	reasonInvalid      = "token did not validate"
+	reasonNoSubject    = "token carries no subject"
+	reasonRevoked      = "token is on the denylist"
+	reasonDenylistDown = "denylist could not be read"
+	reasonScope        = "token does not carry the required scope"
+	reasonNoGrants     = "token carries no context grants"
+	// The two doors are disjoint. A service token carries no person, and a
+	// person token is not a platform; admitting either where it does not belong
+	// would let a route decide on a caller it does not understand.
+	reasonServiceOnUser    = "a service token was presented to a route that serves a person"
+	reasonNotService       = "a person's token was presented to a service route"
+	reasonNoServiceContext = "service request names no context"
+	reasonHandlerFailed    = "handler failed"
 )
 
 // realm identifies this service in the challenge, so a client presenting a token
@@ -201,6 +226,15 @@ func (g *Guard) Serve(h Handler) http.Handler {
 			return
 		}
 		caller := Caller{Principal: claims}
+
+		// The doors are disjoint. A service token carries no person and no
+		// context, so every remaining check here is written about somebody: the
+		// grant set, the active context, the scope. Admitting one would make each
+		// of those checks pass or fail for reasons nobody chose.
+		if caller.IsService() {
+			g.refuse(w, r, reasonServiceOnUser, nil)
+			return
+		}
 
 		if caller.Subject() == "" {
 			g.refuse(w, r, reasonNoSubject, nil)
@@ -262,6 +296,92 @@ func (g *Guard) Serve(h Handler) http.Handler {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 		}
 	})
+}
+
+// ServeService authenticates a caller for a route that acts in a context named by
+// its request. It is the second door, and it is deliberately not Serve with the
+// grants check relaxed.
+//
+// What it does NOT do is open a transaction, and that is the whole of the
+// difference. Every rule about which context a write belongs to is written around
+// a token that carries one, and there is no honest way to keep those rules for a
+// caller that cannot: the context has to arrive with the request. So this door
+// establishes only that the caller is a service with the right scope, and the
+// handler opens the transaction in the context it was given.
+//
+// Three things it insists on, because each is a way this could otherwise be
+// mistaken for the ordinary door:
+//
+//   - the token must be a service token. A person's token is refused, so a
+//     compromised mentor session cannot reach this route even if it somehow
+//     carried the scope.
+//   - the scope must be the one the route was built with. Not a superset: a
+//     service token that could also push field data would make one leaked
+//     credential good for both.
+//   - revocation is checked exactly as it is for a person. A service is not
+//     exempt from being switched off.
+func (g *Guard) ServeService(scope string) func(ServiceHandler) http.Handler {
+	return func(h ServiceHandler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token, ok := bearer(r.Header.Get("Authorization"))
+			if !ok {
+				g.refuse(w, r, reasonNoHeader, nil)
+				return
+			}
+			raw, err := g.tokens.Validate(token)
+			if err != nil || raw == nil {
+				g.refuse(w, r, reasonInvalid, err)
+				return
+			}
+			claims, ok := raw.(Principal)
+			if !ok {
+				g.refuse(w, r, reasonInvalid, errors.New("verifier returned claims that are not a Principal"))
+				return
+			}
+			caller := Caller{Principal: claims}
+
+			if !caller.IsService() {
+				g.refuse(w, r, reasonNotService, nil)
+				return
+			}
+			if caller.Subject() == "" {
+				g.refuse(w, r, reasonNoSubject, nil)
+				return
+			}
+			issuedAt, haveIssuedAt := caller.IssuedAt()
+			if !haveIssuedAt {
+				g.refuse(w, r, reasonRevoked, errors.New("token carries no issue time"))
+				return
+			}
+			revoked, err := g.revoked.Revoked(r.Context(), caller.Subject(), issuedAt, caller.Epoch())
+			if err != nil {
+				// Fail closed for the same reason as the ordinary door: admitting
+				// traffic because the thing which would have stopped it cannot be
+				// read is the failure this system exists to avoid.
+				g.refuse(w, r, reasonDenylistDown, err)
+				return
+			}
+			if revoked {
+				g.refuse(w, r, reasonRevoked, nil)
+				return
+			}
+			if !caller.HasScope(scope) {
+				g.refuse(w, r, reasonScope, fmt.Errorf("scope %q is required", scope))
+				return
+			}
+			if err := h(w, r, caller); err != nil {
+				if errors.Is(err, ErrAnswered) {
+					return
+				}
+				if g.log != nil {
+					g.log.Refused(r, reasonHandlerFailed, err)
+				}
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"internal_error"}`))
+			}
+		})
+	}
 }
 
 // refuse writes the same refusal for every reason.

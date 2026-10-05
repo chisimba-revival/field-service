@@ -18,6 +18,9 @@ import (
 // minting RSA keys, which is the point: the interesting failures here are the
 // ordering of the checks and what reaches the handler, not the signature.
 type fakePrincipal struct {
+	// typ is left empty by the existing tests, which is the point: a token with
+	// no type claim is a person's token for every check here.
+	typ    string
 	sub    string
 	scopes []string
 	active string
@@ -27,6 +30,7 @@ type fakePrincipal struct {
 	noIat  bool
 }
 
+func (f fakePrincipal) TokenType() string     { return f.typ }
 func (f fakePrincipal) Subject() string       { return f.sub }
 func (f fakePrincipal) Scopes() []string      { return f.scopes }
 func (f fakePrincipal) ActiveContext() string { return f.active }
