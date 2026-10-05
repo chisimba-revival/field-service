@@ -11,6 +11,7 @@ package wiring
 import (
 	"context"
 	"errors"
+	"github.com/jackc/pgx/v5"
 	"strings"
 	"time"
 
@@ -252,7 +253,11 @@ func (s *PgxSession) Querier(ctx context.Context, callerID string, grants []stri
 		return err
 	}
 
-	if err := fn(readable{tx}); err != nil {
+	raw, err := pgxOf(tx)
+	if err != nil {
+		return err
+	}
+	if err := fn(readable{raw}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -263,13 +268,33 @@ func (s *PgxSession) Querier(ctx context.Context, callerID string, grants []stri
 // It exposes no Commit and no Exec, deliberately. A handler that could write
 // outside a checked statement, or end the transaction it is reading in, would be
 // able to do things the read boundary was set up to prevent.
-type readable struct{ tx PgxTx }
+type readable struct{ tx pgx.Tx }
 
-func (r readable) Query(ctx context.Context, sql string, args ...any) (httpapi.Rows, error) {
+func (r readable) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	return r.tx.Query(ctx, sql, args...)
 }
-func (r readable) QueryRow(ctx context.Context, sql string, args ...any) httpapi.Row {
+func (r readable) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return r.tx.QueryRow(ctx, sql, args...)
+}
+
+// pgxOf recovers the real pgx transaction from whatever the pool handed back.
+//
+// A pool that is not the one in adapters.go — a fake in a test, say — may hand
+// back something that is already a pgx.Tx and has no Raw method, so both shapes
+// are accepted. Refusing the second would make the transaction in a test a
+// different type from the transaction in production, which is the arrangement
+// that lets a test pass against a thing that cannot work.
+func pgxOf(tx PgxTx) (pgx.Tx, error) {
+	if raw, ok := tx.(RawQuerier); ok {
+		return raw.Raw(), nil
+	}
+	// The second branch an earlier version of this had — asserting the
+	// transaction is already a pgx.Tx — is impossible, and go vet said so. A type
+	// cannot implement both PgxTx and pgx.Tx, because their Exec methods return
+	// different types. So the read handle can only be built from a transaction
+	// that came through this package's adapter, which is one more reason the
+	// adapter lives here rather than in the assembly file.
+	return nil, errors.New("wiring: transaction cannot be read as a pgx.Tx")
 }
 
 // joinGrants renders the grant set the way the policies parse it.

@@ -95,7 +95,7 @@ func (s *Sync) pushHandler() Handler {
 			// infer it from results that look successful. The reason goes to the
 			// log: a Postgres error names tables, columns and constraints, which
 			// is a schema handed to whoever can read the response.
-			return s.internal(w, err)
+			return s.internal(w, r, err)
 		}
 		return writeJSON(w, http.StatusOK, map[string]any{"results": results})
 	}
@@ -120,7 +120,7 @@ func (s *Sync) pullHandler() Handler {
 				return err
 			})
 		if err != nil {
-			return s.internal(w, err)
+			return s.internal(w, r, err)
 		}
 		return writeJSON(w, http.StatusOK, page)
 	}
@@ -180,8 +180,23 @@ func writeJSON(w http.ResponseWriter, status int, body any) error {
 //
 // The code is for the client and the sentence is for the person holding the
 // phone. Returning the code as the message would be a shrug.
+// problem writes a client-visible error and returns ErrAnswered.
+//
+// The sentinel is the whole point, and its absence was a bug found only by
+// running the service. Returning writeJSON's error means returning nil on
+// success — and a handler that treats a non-nil error as "stop" cannot tell
+// "refused, already answered" from "carried on". So a request with the wrong
+// content type was answered with 415 and then processed anyway, writing a
+// second body whose status line Go discarded with a "superfluous
+// WriteHeader" warning, and the client received a truncated response.
+//
+// A refusal has to be distinguishable from a success, or the handler keeps
+// going. The guard recognises this sentinel and adds nothing to the response.
 func problem(w http.ResponseWriter, status int, code, message string) error {
-	return writeJSON(w, status, map[string]any{"error": code, "message": message})
+	if err := writeJSON(w, status, map[string]any{"error": code, "message": message}); err != nil {
+		return err
+	}
+	return ErrAnswered
 }
 
 // internal reports a fault to the log and describes none of it to the client.
@@ -192,9 +207,14 @@ func problem(w http.ResponseWriter, status int, code, message string) error {
 // error is actually logged rather than assigned to a blank identifier, as the
 // first version of this function did while a comment beside it claimed the
 // detail reached the log.
-func (s *Sync) internal(w http.ResponseWriter, err error) error {
+func (s *Sync) internal(w http.ResponseWriter, r *http.Request, err error) error {
 	if s.Log != nil {
-		s.Log.Refused(nil, "handler_failed", err)
+		// The request, never nil. Passing nil was a shortcut because this
+		// function had been given only the writer, and it cost a panic: a
+		// logger that reads r.Method dereferenced it, the handler died mid
+		// response, and the client got nothing at all — so the very error this
+		// function exists to report was the one thing never reported.
+		s.Log.Refused(r, "handler_failed", err)
 	}
 	return problem(w, http.StatusInternalServerError, "internal_error",
 		"That did not go through. Nothing was changed.")

@@ -667,3 +667,56 @@ func TestMain(m *testing.M) {
 	_ = conn.Close(context.Background())
 	os.Exit(code)
 }
+
+// A payload missing a field it must carry is refused, not attempted.
+//
+// Found by sending a real HTTP request with no drive_id: it reached the insert
+// as the empty string, the database refused it with a type error, and the whole
+// batch came back as a 500. Every other client mistake here is a refusal, so the
+// inconsistency mattered as much as the fault — and one bad operation taking
+// three good ones with it is exactly what the contract forbids.
+func TestACreateMissingItsDriveIsRefusedRatherThanFailingTheBatch(t *testing.T) {
+	svc, conn := service(t, ctxNorth)
+	defer func() { _ = conn.Close(context.Background()) }()
+	seedDrive(t, conn, driveNorth, ctxNorth)
+
+	op := aCreate("op-no-drive", driveNorth, "LEOP", 2)
+	delete(op.Payload, "drive_id")
+
+	got, err := svc.Push(context.Background(),
+		push.Caller{ID: "user-1", WriteContext: ctxNorth}, []push.Operation{op})
+	if err != nil {
+		t.Fatalf("one bad operation failed the batch: %v", err)
+	}
+	if got[0].Outcome != push.OutcomeRefused {
+		t.Errorf("outcome %q, want refused", got[0].Outcome)
+	}
+	if got[0].ErrorCode != "create_without_drive_id" {
+		t.Errorf("code %q", got[0].ErrorCode)
+	}
+}
+
+// The other two in the same batch must still land.
+func TestAGoodOperationInTheSameBatchStillLands(t *testing.T) {
+	svc, conn := service(t, ctxNorth)
+	defer func() { _ = conn.Close(context.Background()) }()
+	seedDrive(t, conn, driveNorth, ctxNorth)
+
+	bad := aCreate("op-no-drive", driveNorth, "LEOP", 2)
+	delete(bad.Payload, "drive_id")
+	good := aCreate("op-fine", driveNorth, "LION", 1)
+
+	got, err := svc.Push(context.Background(),
+		push.Caller{ID: "user-1", WriteContext: ctxNorth},
+		[]push.Operation{bad, good})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Outcome != push.OutcomeRefused {
+		t.Errorf("the bad one came back %q", got[0].Outcome)
+	}
+	if got[1].Outcome != push.OutcomeApplied {
+		t.Errorf("the good one came back %q. A device that recorded three things "+
+			"and had one malformed needs the other two.", got[1].Outcome)
+	}
+}

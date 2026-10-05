@@ -152,6 +152,24 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 		}, nil
 	}
 
+	// A payload missing a field it must carry is refused, not attempted.
+	//
+	// Found by sending a real request with no drive_id: it became the empty
+	// string, the insert failed with "invalid input syntax for type uuid", and
+	// the whole batch came back as a 500. Every other client mistake here is
+	// refused — an unknown kind, a create carrying a base_revision, a correction
+	// with no revision — so letting a missing field through to the database was
+	// an inconsistency as well as a fault. Worse than the 500 was the direction:
+	// one bad operation in a batch of four took all four with it, and the rule is
+	// that a batch is not all-or-nothing.
+	if !isUUID(payloadUUID(op.Payload, "drive_id")) {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "create_without_drive_id",
+			ClientState: op.Payload,
+		}, nil
+	}
+
 	// The context comes from the caller, never from the payload. There is no
 	// context field on Operation to read even if a client sent one, and the value
 	// is bound rather than interpolated.
@@ -426,6 +444,35 @@ func payloadFloatPtr(m map[string]any, k string) *float64 {
 	}
 	return nil
 }
+
+// isUUID reports whether s is a uuid as PostgreSQL would accept one.
+//
+// Checked here rather than left to the database so the answer is a refusal with a
+// code a client can branch on, instead of a 500 with a type error in it. The
+// format is checked by hand rather than parsed, because the only question is
+// "would the database accept this", and a parser would be a second, looser idea
+// of the same thing.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func payloadUUID(m map[string]any, k string) string {
 	if s, ok := m[k].(string); ok {
 		return s

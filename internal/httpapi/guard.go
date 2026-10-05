@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"net/http"
 	"strings"
 	"time"
@@ -95,23 +96,19 @@ type Session interface {
 // Querier is what a handler reads through, and the only thing it needs.
 //
 // Deliberately narrower than a database handle: a handler cannot begin a
-// transaction, cannot commit one, and cannot set a setting. So the read boundary
-// cannot be widened from inside a handler even by accident.
+// transaction, cannot commit one, and cannot Exec. So the read boundary cannot
+// be widened from inside a handler even by accident.
+//
+// The row types are pgx's own rather than interfaces declared here. That is not
+// a compromise for convenience — it is because a handler hands this straight to
+// the pull store, which also wants pgx's row types, and two structurally
+// identical interfaces with different names do not satisfy each other. Declaring
+// a second set of identical shapes here would only create a place for the two
+// to drift apart.
 type Querier interface {
-	Query(ctx context.Context, sql string, args ...any) (Rows, error)
-	QueryRow(ctx context.Context, sql string, args ...any) Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
-
-// Rows is one result set.
-type Rows interface {
-	Next() bool
-	Scan(dest ...any) error
-	Err() error
-	Close()
-}
-
-// Row is one row.
-type Row interface{ Scan(dest ...any) error }
 
 // Logger records why a request was refused.
 //
@@ -120,6 +117,13 @@ type Row interface{ Scan(dest ...any) error }
 type Logger interface {
 	Refused(r *http.Request, reason string, err error)
 }
+
+// ErrAnswered says a handler has already written its response and the guard
+// should add nothing.
+//
+// It exists because "refused" and "carried on" cannot both be signalled by a nil
+// error. See problem() in sync_routes.go for what went wrong without it.
+var ErrAnswered = errors.New("httpapi: response already written")
 
 // Handler is what a route does once the caller is known.
 //
@@ -245,6 +249,12 @@ func (g *Guard) Serve(h Handler) http.Handler {
 			func(ctx context.Context) error {
 				return h(w, r, caller)
 			}); err != nil {
+			if errors.Is(err, ErrAnswered) {
+				// The handler already wrote a deliberate response. Adding a 500
+				// here would overwrite a 415 that was correct, and the client's
+				// only clue would be a truncated body.
+				return
+			}
 			// The caller was authorised. A handler that fails is an internal
 			// fault and must not be reported as an authorisation problem, or the
 			// logs will say "unauthorised" about requests that were permitted.

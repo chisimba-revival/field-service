@@ -222,7 +222,11 @@ func TestAFaultIsLoggedAndNotDescribedToTheClient(t *testing.T) {
 	log := &quietLog{}
 	s := &Sync{Session: aWorkingSession{}, Log: log}
 	w := httptest.NewRecorder()
-	s.internal(w, errors.New(`pq: duplicate key value violates unique constraint "sighting_pkey"`))
+	// A real request, because the logger is handed one. The first version of
+	// this test passed nil and would have panicked in the adapter it was
+	// exercising — which is exactly how the nil reached production unnoticed.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sync/push", nil)
+	s.internal(w, req, errors.New(`pq: duplicate key value violates unique constraint "sighting_pkey"`))
 
 	if got := w.Code; got != http.StatusInternalServerError {
 		t.Errorf("%d, want 500", got)
