@@ -183,6 +183,43 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 		}, nil
 	}
 
+	// A drive that does not exist, or exists in a context this caller cannot
+	// write to, is refused here rather than left to the foreign key.
+	//
+	// Two reasons, and they are different in kind.
+	//
+	// The first is consistency. Every other client mistake in this file is a
+	// refusal — an unknown kind, a create carrying a base_revision, a missing
+	// drive_id. A drive that is not there is the same kind of mistake, and it was
+	// arriving as a 500 because the constraint violation was the thing reporting
+	// it. Worse than the status was the direction: one bad operation in a batch
+	// of four took all four with it, and a batch is not all-or-nothing.
+	//
+	// The second is that this check cannot be left to the database. Push opens
+	// its own transaction and never sets app.context_grants, and the runtime it
+	// is deployed against is a superuser, which PostgreSQL exempts from
+	// row-level security outright. The policies would not have caught this even
+	// if the foreign key had been satisfied — so a drive in another context is
+	// refused because this code compares the two, not because something
+	// downstream was trusted to.
+	//
+	// The two cases deliberately share one error code. Reporting "no such
+	// drive" for a drive that exists in somebody else's context would turn this
+	// into an oracle: a caller could walk the id space and learn which drives
+	// other reserves have planned, which is exactly what the grant set exists to
+	// withhold.
+	known, err := t.driveInContext(ctx, payloadUUID(op.Payload, "drive_id"), caller.WriteContext)
+	if err != nil {
+		return Result{}, err
+	}
+	if !known {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "unknown_drive",
+			ClientState: op.Payload,
+		}, nil
+	}
+
 	// The context comes from the caller, never from the payload. There is no
 	// context field on Operation to read even if a client sent one, and the value
 	// is bound rather than interpolated.
@@ -196,7 +233,7 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 		returning revision`
 
 	var revision int64
-	err := t.tx.QueryRow(ctx, q,
+	err = t.tx.QueryRow(ctx, q,
 		op.EntityID, caller.WriteContext, payloadUUID(op.Payload, "drive_id"),
 		payloadText(op.Payload, "species_code"), payloadInt(op.Payload, "count"),
 		payloadFloat(op.Payload, "longitude"), payloadFloat(op.Payload, "latitude"),
@@ -236,6 +273,24 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 // correction without one — but a constraint violation arriving as a plain error
 // would tell the client only that something went wrong, so it is recognised here
 // and named.
+// driveInContext reports whether a drive exists in the given context.
+//
+// The context is compared here rather than being relied upon to be enforced
+// downstream, because on this path nothing downstream is enforcing it: see the
+// note at the refusal above. A true answer means the drive is in that context;
+// a false answer means it is not there, or is somewhere this caller cannot see,
+// and the caller is told the same thing either way.
+func (t *pgxTx) driveInContext(ctx context.Context, driveID, context string) (bool, error) {
+	const q = `select exists (
+		select 1 from drive where id = $1 and context_code = $2
+	)`
+	var known bool
+	if err := t.tx.QueryRow(ctx, q, driveID, context).Scan(&known); err != nil {
+		return false, err
+	}
+	return known, nil
+}
+
 func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Result, error) {
 	if op.Entity != "sighting" {
 		return unsupported(op, "sighting"), nil

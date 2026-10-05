@@ -292,4 +292,85 @@ type pushResult struct {
 	OperationID string `json:"operation_id"`
 	Outcome     string `json:"outcome"`
 	NewRevision int    `json:"new_revision"`
+	ErrorCode   string `json:"error_code"`
+}
+
+// TestADriveOutsideTheCallersContextIsRefused covers the refusal that the
+// foreign key cannot make for us.
+//
+// Three things are asserted deliberately, and the middle one is the reason the
+// test exists at all.
+//
+// A drive that is not there is refused as a client mistake, not as a server
+// fault. It used to arrive as a 500, which is the one status that tells a client
+// nothing useful and takes a whole batch down with the operation that caused it.
+//
+// A drive belonging to a *different* context is refused too, and this is the
+// case the database was never going to catch: push opens its own transaction
+// and never sets app.context_grants, and the deployed role is a superuser, so
+// row-level security was never going to run on this path. The comparison happens
+// in this code or it does not happen.
+//
+// Both refusals carry the same code. Distinguishing them would turn the response
+// into an oracle: a caller could walk the id space and learn which drives other
+// reserves have planned, which is what the grant set exists to withhold.
+//
+// A drive in the caller's own context still lands, so the refusal is not simply
+// refusing everything.
+func TestADriveOutsideTheCallersContextIsRefused(t *testing.T) {
+	r := start(t)
+
+	t.Run("a drive that is not there", func(t *testing.T) {
+		op := r.sighting("e2e-nodrive")
+		op["payload"].(map[string]any)["drive_id"] = "00000000-0000-4000-8000-000000000000"
+
+		status, body := r.push(r.token(0, "e2e-nodrive"), batch(op))
+		// The status is the point. A 500 would tell the client to retry, and a
+		// retry of a sighting naming a drive that does not exist can never work.
+		if status != http.StatusOK {
+			t.Fatalf("want the batch accepted with a refusal inside it, got %d: %s", status, body)
+		}
+		got := results(t, body)
+		if len(got) != 1 || got[0].Outcome != "refused" {
+			t.Fatalf("want one refused operation, got %s", body)
+		}
+		if got[0].ErrorCode != "unknown_drive" {
+			t.Errorf("error_code = %q, want unknown_drive: %s", got[0].ErrorCode, body)
+		}
+		if n := r.countRows(t, op["entity_id"].(string)); n != 0 {
+			t.Errorf("%d rows written for a sighting on a drive that does not exist, want 0", n)
+		}
+	})
+
+	t.Run("a drive in another context", func(t *testing.T) {
+		// The drive genuinely exists, in a context this caller is not granted.
+		other := r.ensureDrive("e2e-other-context")
+		op := r.sighting("e2e-mine")
+		op["payload"].(map[string]any)["drive_id"] = other
+
+		status, body := r.push(r.token(0, "e2e-mine"), batch(op))
+		if status != http.StatusOK {
+			t.Fatalf("push: %d %s", status, body)
+		}
+		got := results(t, body)
+		if len(got) != 1 || got[0].Outcome != "refused" {
+			t.Fatalf("want a refusal for a drive in another context, got %s", body)
+		}
+		if n := r.countRows(t, op["entity_id"].(string)); n != 0 {
+			t.Errorf("%d rows written against another context's drive, want 0", n)
+		}
+	})
+
+	t.Run("a drive in the caller's own context", func(t *testing.T) {
+		op := r.sighting("e2e-owncontext")
+		status, body := r.push(r.token(0, "e2e-owncontext"), batch(op))
+		if status != http.StatusOK {
+			t.Fatalf("push: %d %s", status, body)
+		}
+		got := results(t, body)
+		if len(got) != 1 || got[0].Outcome != "applied" {
+			t.Fatalf("a drive in the caller's own context must be accepted, got %s", body)
+		}
+		assertRow(t, r, op["entity_id"].(string), "e2e-owncontext", "42")
+	})
 }
