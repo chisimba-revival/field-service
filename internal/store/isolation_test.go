@@ -86,7 +86,11 @@ func asRuntime(t *testing.T, fn func(context.Context, *pgx.Conn)) {
 func seed(t *testing.T, conn *pgx.Conn) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := conn.Exec(ctx, `truncate drive, sighting`); err != nil {
+	// cascade, and every table listed: migration 0003 added trail_log,
+	// trail_waypoint and media, which reference drive and sighting, so a
+	// bare truncate of the two original tables is refused. Found by running
+	// these tests after 0003, which is the only place it could be found.
+	if _, err := conn.Exec(ctx, `truncate drive, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	for i, d := range []struct{ id, context, guide string }{

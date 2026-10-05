@@ -219,3 +219,28 @@ drop policy if exists operation_outcome_own_only on operation_outcome;
 create policy operation_outcome_own_only on operation_outcome
   using (caller_user_id::text = current_setting('app.caller_user_id'))
   with check (caller_user_id::text = current_setting('app.caller_user_id'));
+
+-- The runtime role's reach has to follow the schema.
+--
+-- Migration 0002 granted the runtime role DML on the two tables that existed at
+-- the time. Every table created since is unreachable from it, so a request that
+-- passed every access check would then be refused by the database for lacking a
+-- privilege — an authorisation failure reported as a server error, which sends
+-- whoever is debugging it looking at the guard rather than here.
+--
+-- Granting by table rather than by granting on all future tables is deliberate.
+-- `grant ... on all tables in schema public` would silently extend the
+-- application's reach to any table a later migration adds, including the
+-- bookkeeping ones it has no business reading.
+revoke all on trail_log, trail_waypoint, change_feed, media, operation_outcome from fieldapp;
+grant select, insert, update, delete on trail_log to fieldapp;
+grant select, insert on trail_waypoint to fieldapp;
+grant select, insert on change_feed to fieldapp;
+grant select, insert, update, delete on media to fieldapp;
+grant select, insert on operation_outcome to fieldapp;
+
+-- change_feed is append-only from the client's point of view and written only by
+-- the service. Revoking update and delete on it is what makes that true rather
+-- than merely intended, so the grant above is deliberately narrower than the
+-- pattern and the two statements together say so.
+revoke update, delete on change_feed from fieldapp;
