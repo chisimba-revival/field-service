@@ -108,7 +108,7 @@ func reset(t *testing.T, conn *pgx.Conn) {
 	// in parallel. The advisory lock in TestMain serialises them; this clears the
 	// fixtures the last one left.
 	if _, err := conn.Exec(context.Background(),
-		`truncate change_feed, operation_outcome, media, trail_waypoint, trail_log, sighting, outing, drive_detail, hike_detail, camp_detail cascade`); err != nil {
+		`truncate change_feed, operation_outcome, media, trail_waypoint, log_book_entry, outing, drive_detail, hike_detail, camp_detail cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 }
@@ -134,8 +134,8 @@ func feed(t *testing.T, conn *pgx.Conn, contextCode, entity string, revision int
 // than by any filter here — so a fake store cannot demonstrate it.
 func TestACallerSeesOnlyTheContextsTheyAreGranted(t *testing.T) {
 	a := admin(t)
-	feed(t, a, "north-reserve", "sighting", 1)
-	feed(t, a, "south-reserve", "sighting", 1)
+	feed(t, a, "north-reserve", "log_book_entry", 1)
+	feed(t, a, "south-reserve", "log_book_entry", 1)
 
 	got, err := pull.New(pull.NewPgxStore(runtime(t, "north-reserve"))).
 		Pull(context.Background(), "user-1", "")
@@ -155,8 +155,8 @@ func TestACallerSeesOnlyTheContextsTheyAreGranted(t *testing.T) {
 // reason the feed serialises each row rather than joining at read time.
 func TestChangesArriveOldestFirstAndCarryTheRowItself(t *testing.T) {
 	a := admin(t)
-	first := feed(t, a, "north-reserve", "sighting", 1)
-	second := feed(t, a, "north-reserve", "sighting", 2)
+	first := feed(t, a, "north-reserve", "log_book_entry", 1)
+	second := feed(t, a, "north-reserve", "log_book_entry", 2)
 
 	got, err := pull.New(pull.NewPgxStore(runtime(t, "north-reserve"))).
 		Pull(context.Background(), "user-1", "")
@@ -176,9 +176,9 @@ func TestChangesArriveOldestFirstAndCarryTheRowItself(t *testing.T) {
 
 func TestACursorResumesWhereTheLastPageEnded(t *testing.T) {
 	a := admin(t)
-	feed(t, a, "north-reserve", "sighting", 1)
-	second := feed(t, a, "north-reserve", "sighting", 2)
-	feed(t, a, "north-reserve", "sighting", 3)
+	feed(t, a, "north-reserve", "log_book_entry", 1)
+	second := feed(t, a, "north-reserve", "log_book_entry", 2)
+	feed(t, a, "north-reserve", "log_book_entry", 3)
 
 	svc := pull.New(pull.NewPgxStore(runtime(t, "north-reserve")))
 	got, err := svc.Pull(context.Background(), "user-1", pull.Cursor(second))
@@ -195,9 +195,9 @@ func TestACursorResumesWhereTheLastPageEnded(t *testing.T) {
 
 func TestHasMoreIsTrueWhenMoreChangesRemain(t *testing.T) {
 	a := admin(t)
-	feed(t, a, "north-reserve", "sighting", 1)
-	feed(t, a, "north-reserve", "sighting", 2)
-	feed(t, a, "north-reserve", "sighting", 3)
+	feed(t, a, "north-reserve", "log_book_entry", 1)
+	feed(t, a, "north-reserve", "log_book_entry", 2)
+	feed(t, a, "north-reserve", "log_book_entry", 3)
 
 	got, err := pull.New(pull.NewPgxStore(runtime(t, "north-reserve"))).
 		Pull(context.Background(), "user-1", pull.Cursor(0))
@@ -215,9 +215,9 @@ func TestHasMoreIsTrueWhenMoreChangesRemain(t *testing.T) {
 // retention job does.
 func TestRetentionThatHasEatenRowsProducesAResyncRatherThanAShortPage(t *testing.T) {
 	a := admin(t)
-	oldest := feed(t, a, "north-reserve", "sighting", 1)
-	feed(t, a, "north-reserve", "sighting", 2)
-	feed(t, a, "north-reserve", "sighting", 3)
+	oldest := feed(t, a, "north-reserve", "log_book_entry", 1)
+	feed(t, a, "north-reserve", "log_book_entry", 2)
+	feed(t, a, "north-reserve", "log_book_entry", 3)
 
 	// Prune everything the client has not yet seen.
 	if _, err := a.Exec(context.Background(),
@@ -262,7 +262,7 @@ func TestAnEmptyFeedIsNotAResync(t *testing.T) {
 // grants would read the whole feed.
 func TestAnUnsetGrantsSettingFailsRatherThanReadingEverything(t *testing.T) {
 	a := admin(t)
-	feed(t, a, "north-reserve", "sighting", 1)
+	feed(t, a, "north-reserve", "log_book_entry", 1)
 
 	conn, err := pgx.Connect(context.Background(), dsn)
 	if err != nil {

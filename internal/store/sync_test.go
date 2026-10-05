@@ -25,17 +25,15 @@ const (
 func seedSync(t *testing.T, conn *pgx.Conn) {
 	t.Helper()
 	ctx := context.Background()
-	// Every table, with cascade: trail_log, trail_waypoint and media reference
-	// drive and sighting, so truncating a subset is refused outright.
-	if _, err := conn.Exec(ctx, `truncate outing, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
+	// Every table, with cascade: trail_waypoint and media reference the outing and
+	// the log book, so truncating a subset is refused outright.
+	if _, err := conn.Exec(ctx, `truncate outing, log_book_entry, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	// rifle_role, not a trail code: second-rifle hours are counted separately
-	// from first-rifle and from a participant's own, and merging them is the one
-	// thing this column exists to prevent.
-	// The drives are re-inserted here because the truncate above clears them and
-	// trail_log.outing_id is a foreign key. A trail log belongs to a drive, so a
-	// trail fixture without one is not a smaller fixture, it is an invalid one.
+	// The outings are re-inserted here because the truncate above clears them and
+	// trail_waypoint.outing_id is a foreign key. A waypoint belongs to an outing,
+	// so a trail fixture without one is not a smaller fixture, it is an invalid
+	// one.
 	for _, d := range []struct{ id, ctxCode, guide string }{
 		{outingNorth, ctxNorth, "guide-a"},
 		{outingSouth, ctxSouth, "guide-b"},
@@ -48,15 +46,20 @@ func seedSync(t *testing.T, conn *pgx.Conn) {
 		}
 	}
 
-	for _, l := range []struct{ id, drive, ctxCode, role string }{
-		{logNorth, outingNorth, ctxNorth, "first"},
-		{logSouth, outingSouth, ctxSouth, "second"},
+	// One waypoint per context. This fixture used to be a trail_log row, which had
+	// rifle_role on it: second-rifle hours are counted separately from first-rifle
+	// and from a participant's own, and merging them is the one thing that column
+	// exists to prevent. That column now lives on hike_detail with the rest of the
+	// hike's detail, so the per-context row this test needs is a waypoint instead.
+	for _, w := range []struct{ outing, ctxCode string }{
+		{outingNorth, ctxNorth},
+		{outingSouth, ctxSouth},
 	} {
 		if _, err := conn.Exec(ctx,
-			`insert into trail_log (id, context_code, outing_id, started_at, rifle_role, created_by)
-			 values ($1, $2, $3, now(), $4, 'guide')`,
-			l.id, l.ctxCode, l.drive, l.role); err != nil {
-			t.Fatalf("insert trail_log %s: %v", l.ctxCode, err)
+			`insert into trail_waypoint (outing_id, context_code, ordinal, point, captured_at)
+			 values ($1, $2, 1, st_makepoint(36.8, -1.29), now())`,
+			w.outing, w.ctxCode); err != nil {
+			t.Fatalf("insert trail_waypoint %s: %v", w.ctxCode, err)
 		}
 	}
 }
@@ -96,8 +99,7 @@ func TestEveryContextBearingTableIsIsolated(t *testing.T) {
 		table  string
 		column string
 	}{
-		{"trail_log", "trail_log_id"},
-		{"trail_waypoint", "trail_log_id"},
+		{"trail_waypoint", "outing_id"},
 		{"change_feed", "seq"},
 		{"media", "id"},
 	}
@@ -105,42 +107,31 @@ func TestEveryContextBearingTableIsIsolated(t *testing.T) {
 		t.Run(tc.table, func(t *testing.T) {
 			// Seed one row per context in the table's own terms.
 			switch tc.table {
-			case "trail_log":
-				// already seeded
 			case "trail_waypoint":
-				for i, l := range []struct{ id, ctxCode string }{{logNorth, ctxNorth}, {logSouth, ctxSouth}} {
-					for ord := 0; ord <= i; ord++ {
-						// context_code is carried on the waypoint itself rather
-						// than read through the parent log: a policy cannot
-						// reach through a join without a SECURITY DEFINER
-						// function, which would move the decision out of the
-						// database's own hands.
-						if _, err := conn.Exec(context.Background(),
-							`insert into trail_waypoint (trail_log_id, ordinal, context_code, point, captured_at)
-							 values ($1, $2, $3, st_setsrid(st_makepoint($4, $5), 4326), now())`,
-							l.id, ord, l.ctxCode, 36.8+float64(ord)*0.01, -1.2); err != nil {
-							t.Fatalf("insert waypoint: %v", err)
-						}
-					}
-				}
+				// already seeded by seedSync, which puts one waypoint on
+				// each outing. It used to seed its own here as well, and the
+				// subtest then expected one row per context — which only held
+				// while nothing else wrote to the table. Two rows in the
+				// granted context is the correct answer to a question about
+				// two rows, and the failure read as a missing policy.
 			case "change_feed":
 				for i, c := range []string{ctxNorth, ctxSouth} {
 					if _, err := conn.Exec(context.Background(),
 						`insert into change_feed (context_code, entity_type, entity_id, revision, body)
-						 values ($1, 'sighting', gen_random_uuid(), $2, '{}'::jsonb)`,
+						 values ($1, 'log_book_entry', gen_random_uuid(), $2, '{}'::jsonb)`,
 						c, i+1); err != nil {
 						t.Fatalf("insert feed row: %v", err)
 					}
 				}
 			case "media":
-				// sighting_id is a real foreign key, so the parent row has to
+				// log_book_entry_id is a real foreign key, so the parent row has to
 				// exist rather than being a generated uuid.
 				for _, m := range []struct{ ctxCode, parent, drive string }{
 					{ctxNorth, sightNorth, outingNorth},
 					{ctxSouth, sightSouth, outingSouth},
 				} {
 					if _, err := conn.Exec(context.Background(),
-						`insert into sighting (id, context_code, outing_id, location,
+						`insert into log_book_entry (id, context_code, outing_id, location,
 						   captured_at, recorded_at, created_by)
 						 values ($1, $2, $3, st_setsrid(st_makepoint(36.8, -1.2), 4326),
 						         now(), now(), 'guide')`,
@@ -149,7 +140,7 @@ func TestEveryContextBearingTableIsIsolated(t *testing.T) {
 					}
 					if _, err := conn.Exec(context.Background(),
 						`insert into media (id, context_code, outing_id, kind, filename,
-						   mime_type, size_bytes, captured_at, state, sighting_id)
+						   mime_type, size_bytes, captured_at, state, log_book_entry_id)
 						 values (gen_random_uuid(), $1, $2, 'photo', 'a.jpg',
 						         'image/jpeg', 10, now(), 'pending', $3)`,
 						m.ctxCode, m.drive, m.parent); err != nil {
@@ -202,9 +193,9 @@ func TestAWaypointCannotBeReplacedInPlace(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := conn.Exec(ctx,
-		`insert into trail_waypoint (trail_log_id, ordinal, context_code, point, captured_at)
-		 values ($1, 1, $2, st_setsrid(st_makepoint(36.8, -1.2), 4326), now())`,
-		logNorth, ctxNorth); err != nil {
+		`insert into trail_waypoint (outing_id, ordinal, context_code, point, captured_at)
+		 values ($1, 7, $2, st_setsrid(st_makepoint(36.8, -1.2), 4326), now())`,
+		outingNorth, ctxNorth); err != nil {
 		t.Fatal(err)
 	}
 
@@ -224,7 +215,7 @@ func TestAWaypointCannotBeReplacedInPlace(t *testing.T) {
 		}
 		_, updateErr = tx.Exec(c,
 			`update trail_waypoint set point = st_setsrid(st_makepoint(0, 0), 4326)
-			 where trail_log_id = $1 and ordinal = 1`, logNorth)
+			 where outing_id = $1 and ordinal = 7`, outingNorth)
 	})
 	if updateErr == nil {
 		t.Fatal("the runtime role moved a waypoint. The contract calls this the " +
@@ -258,18 +249,22 @@ func TestTheSamePositionTwiceIsTwoWaypoints(t *testing.T) {
 	conn := admin(t)
 	ctx := context.Background()
 
-	for ord := 0; ord < 2; ord++ {
+	// Ordinals 8 and 9 rather than 0 and 1: seedSync already puts ordinal 1 on
+	// each outing, and trail_waypoint is keyed (outing_id, ordinal), so reusing
+	// one would collide and the test would report a primary-key error instead of
+	// what it is about.
+	for ord := 8; ord < 10; ord++ {
 		if _, err := conn.Exec(ctx,
-			`insert into trail_waypoint (trail_log_id, ordinal, context_code, point, captured_at)
+			`insert into trail_waypoint (outing_id, ordinal, context_code, point, captured_at)
 			 values ($1, $2, $3, st_setsrid(st_makepoint(36.8, -1.2), 4326), now())`,
-			logNorth, ord, ctxNorth); err != nil {
+			outingNorth, ord, ctxNorth); err != nil {
 			t.Fatalf("ordinal %d: %v. The same position twice is two events.", ord, err)
 		}
 	}
 	var n int
 	if err := conn.QueryRow(ctx,
-		`select count(*) from trail_waypoint where trail_log_id = $1`,
-		logNorth).Scan(&n); err != nil {
+		`select count(*) from trail_waypoint where outing_id = $1 and ordinal >= 8`,
+		outingNorth).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 2 {
@@ -277,41 +272,45 @@ func TestTheSamePositionTwiceIsTwoWaypoints(t *testing.T) {
 	}
 }
 
-// The contract says exactly one of sighting_id or trail_log_id applies. Two, or
-// neither, is a media record that points at nothing or at two things.
-func TestMediaHasExactlyOneParent(t *testing.T) {
+// Media names its outing always, and may name the log book entry it belongs to.
+// What it must never do is name an entry from a different outing or a different
+// context, which is the invariant that replaced the old exactly-one-parent check:
+// a check constraint cannot compare two tables, so this is a trigger.
+func TestMediaMayNameAnEntryFromAnotherOutingOrContext(t *testing.T) {
 	seed(t, admin(t))
 	seedSync(t, admin(t))
 	conn := admin(t)
 	ctx := context.Background()
 	if _, err := conn.Exec(ctx,
-		`insert into sighting (id, context_code, outing_id, location, captured_at, recorded_at, created_by)
+		`insert into log_book_entry (id, context_code, outing_id, location, captured_at, recorded_at, created_by)
 		 values ($1, $2, $3, st_setsrid(st_makepoint(36.8, -1.2), 4326), now(), now(), 'guide')`,
 		sightNorth, ctxNorth, outingNorth); err != nil {
 		t.Fatal(err)
 	}
 	insert := `insert into media (id, context_code, outing_id, kind, filename,
-	           mime_type, size_bytes, captured_at, state, sighting_id, trail_log_id)
+	           mime_type, size_bytes, captured_at, state, log_book_entry_id)
 	           values (gen_random_uuid(), $1, $2, 'photo', 'a.jpg', 'image/jpeg',
-	                   10, now(), 'pending', $3, $4)`
+	                   10, now(), 'pending', $3)`
 
 	cases := []struct {
 		name    string
-		sight   any
-		log     any
+		ctxCode string
+		outing  string
+		entry   any
 		wantErr bool
 	}{
-		{"a sighting only", sightNorth, nil, false},
-		{"a trail log only", nil, logNorth, false},
-		{"both", sightNorth, logNorth, true},
-		{"neither", nil, nil, true},
+		{"its own entry, its own outing", ctxNorth, outingNorth, sightNorth, false},
+		{"no entry at all", ctxNorth, outingNorth, nil, false},
+		{"an entry from another context", ctxNorth, outingNorth, sightSouth, true},
+		{"an entry that does not exist", ctxNorth, outingNorth,
+			"dddddddd-0000-0000-0000-000000000009", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := conn.Exec(ctx, insert, ctxNorth, outingNorth, c.sight, c.log)
+			_, err := conn.Exec(ctx, insert, c.ctxCode, c.outing, c.entry)
 			if c.wantErr && err == nil {
-				t.Error("accepted. Exactly one applies; two parents is ambiguous " +
-					"and none is a record pointing at nothing.")
+				t.Error("accepted. A photograph filed under an outing it was not " +
+					"taken on is a row that looks entirely ordinary and is not.")
 			}
 			if !c.wantErr && err != nil {
 				t.Errorf("rejected a legitimate record: %v", err)
@@ -333,7 +332,7 @@ func TestOperationOutcomeIsScopedToTheCallerNotTheContext(t *testing.T) {
 		`insert into operation_outcome (caller_user_id, operation_id, entity_type,
 		   entity_id, kind, outcome)
 		 values ('11111111-0000-0000-0000-000000000001', gen_random_uuid(),
-		         'sighting', gen_random_uuid(), 'create', 'applied')`); err != nil {
+		         'log_book_entry', gen_random_uuid(), 'create', 'applied')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -386,7 +385,7 @@ func TestTheChangeFeedCarriesTheRowNotJustItsIdentity(t *testing.T) {
 	// An empty body is refused outright: jsonb not null still admits '{}'.
 	if _, err := conn.Exec(ctx,
 		`insert into change_feed (context_code, entity_type, entity_id, revision, body)
-		 values ($1, 'sighting', gen_random_uuid(), 1, '{}'::jsonb)`, ctxNorth); err != nil {
+		 values ($1, 'log_book_entry', gen_random_uuid(), 1, '{}'::jsonb)`, ctxNorth); err != nil {
 		t.Fatal(err)
 	}
 	var body []byte
@@ -509,9 +508,14 @@ func TestIsolationViolationsAreRefusalsNotErrors(t *testing.T) {
 			writeErr = err
 			return
 		}
+		// trail_log was the second table here, holding no observation of anything
+		// and duplicating outing and hike_detail. trail_waypoint is what a write
+		// into an ungranted context looks like now, and it is the better choice:
+		// the old one asserted that a table nobody reads still had a policy.
 		_, writeErr = tx.Exec(ctx,
-			`insert into trail_log (id, context_code, outing_id, started_at, created_by)
-			 values (gen_random_uuid(), $1, $2, now(), 'g')`, ctxSouth, outingNorth)
+			`insert into trail_waypoint (outing_id, ordinal, context_code, point, captured_at)
+			 values ($1, 30, $2, st_setsrid(st_makepoint(36.8, -1.2), 4326), now())`,
+			outingNorth, ctxSouth)
 	})
 	if writeErr == nil {
 		t.Fatal("a write into an ungranted context succeeded")

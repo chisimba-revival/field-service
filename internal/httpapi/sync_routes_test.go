@@ -173,7 +173,7 @@ func TestAnUnknownFieldIsRefusedAtTheBoundary(t *testing.T) {
 		return decode(w, r, &body)
 	})
 	got := post(h, "/api/v1/sync/push",
-		`{"operations":[{"operation_id":"x","entity":"sighting","kind":"create","entity_id":"e","count":2}]}`)
+		`{"operations":[{"operation_id":"x","entity":"log_book_entry","kind":"create","entity_id":"e","count":2}]}`)
 	if got.Code != http.StatusBadRequest {
 		t.Fatalf("%d, want 400. count belongs inside payload, and a client that "+
 			"puts it at the top level would otherwise have it dropped silently.", got.Code)
@@ -203,7 +203,7 @@ func TestTheWriteContextCannotBeSuppliedByTheBody(t *testing.T) {
 	pusher := &recordingPush{}
 	h := aRoutes(pusher, nil)
 
-	body := `{"operations":[{"operation_id":"x","entity":"sighting","kind":"create","entity_id":"e",
+	body := `{"operations":[{"operation_id":"x","entity":"log_book_entry","kind":"create","entity_id":"e",
 	"payload":{"context_code":"south-reserve","contextCode":"south-reserve","ctx":"south-reserve"}}]}`
 	if got := post(h, "/api/v1/sync/push", body); got.Code != http.StatusOK {
 		t.Fatalf("%d, want 200: %s", got.Code, got.Body.String())
@@ -226,13 +226,13 @@ func TestAFaultIsLoggedAndNotDescribedToTheClient(t *testing.T) {
 	// this test passed nil and would have panicked in the adapter it was
 	// exercising — which is exactly how the nil reached production unnoticed.
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/sync/push", nil)
-	s.internal(w, req, errors.New(`pq: duplicate key value violates unique constraint "sighting_pkey"`))
+	s.internal(w, req, errors.New(`pq: duplicate key value violates unique constraint "log_book_entry_pkey"`))
 
 	if got := w.Code; got != http.StatusInternalServerError {
 		t.Errorf("%d, want 500", got)
 	}
 	body := w.Body.String()
-	if strings.Contains(body, "sighting_pkey") || strings.Contains(body, "pq:") {
+	if strings.Contains(body, "log_book_entry_pkey") || strings.Contains(body, "pq:") {
 		t.Errorf("the response carried %q. A Postgres error names the table and "+
 			"the constraint, which is the schema handed to whoever can read it.", body)
 	}

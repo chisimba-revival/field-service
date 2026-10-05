@@ -295,7 +295,7 @@ func TestAnUnknownKindIsRefusedRatherThanAttempted(t *testing.T) {
 // The change feed carries an outing's own row, not a sighting's.
 //
 // This exists because of a defect the other tests could not see. The feed read
-// from sighting for every operation, so creating a hike found no sighting and the
+// from log_book_entry for every operation, so creating a hike found no sighting and the
 // no-row error poisoned the transaction — the client was told "commit
 // unexpectedly resulted in rollback" on a write that had succeeded, and would
 // have retried it for ever. Every other test here passed while that was true,
@@ -369,7 +369,7 @@ func TestASightingCanHangOffAHikeOrACamp(t *testing.T) {
 				t.Fatalf("creating the %s: %d %s", kind.k, status, body)
 			}
 
-			op := r.sighting(ctx)
+			op := r.logBookEntry(ctx)
 			op["payload"].(map[string]any)["outing_id"] = kind.id
 			if status, body := r.push(tok, batch(op)); status != http.StatusOK {
 				t.Fatalf("status %d: %s", status, body)
@@ -377,7 +377,7 @@ func TestASightingCanHangOffAHikeOrACamp(t *testing.T) {
 
 			var gotKind string
 			if err := r.pool.QueryRow(context.Background(),
-				`select o.kind from sighting s join outing o on o.id = s.outing_id
+				`select o.kind from log_book_entry s join outing o on o.id = s.outing_id
 				 where s.id = $1`, op["entity_id"]).Scan(&gotKind); err != nil {
 				t.Fatal(err)
 			}

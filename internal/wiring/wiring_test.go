@@ -343,7 +343,7 @@ func TestTheCallerSettingIsBoundRatherThanInterpolated(t *testing.T) {
 	tx := &fakeTx{}
 	s := NewSession(&fakePool{tx: tx})
 
-	nasty := "user-42'; drop table sighting; --"
+	nasty := "user-42'; drop table log_book_entry; --"
 	if err := s.InTx(context.Background(), nasty, []string{"northern"},
 		func(context.Context) error { return nil }); err != nil {
 		t.Fatalf("InTx: %v", err)

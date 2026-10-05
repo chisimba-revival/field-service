@@ -156,14 +156,14 @@ func (t *pgxTx) Apply(ctx context.Context, caller Caller, op Operation) (Result,
 	return res, nil
 }
 
-// create records a sighting.
+// create records a log book entry.
 //
 // base_revision must be absent. A create that carries one means the client
 // believes it is changing something, and treating that as a create would
 // overwrite whatever the server has without noticing the disagreement.
 func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result, error) {
-	if op.Entity != "sighting" {
-		return unsupported(op, "sighting"), nil
+	if op.Entity != entityLogBookEntry {
+		return unsupported(op, entityLogBookEntry), nil
 	}
 	if op.BaseRevision != nil {
 		return Result{
@@ -232,7 +232,7 @@ func (t *pgxTx) create(ctx context.Context, caller Caller, op Operation) (Result
 	// context field on Operation to read even if a client sent one, and the value
 	// is bound rather than interpolated.
 	const q = `
-		insert into sighting
+		insert into log_book_entry
 		  (id, context_code, outing_id, species_code, count, location,
 		   location_accuracy_m, distance_m, bearing_deg, behaviour, age_sex_class,
 		   notes, status, captured_at, recorded_at, created_by, revision)
@@ -300,8 +300,8 @@ func (t *pgxTx) outingInContext(ctx context.Context, outingID, context string) (
 }
 
 func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Result, error) {
-	if op.Entity != "sighting" {
-		return unsupported(op, "sighting"), nil
+	if op.Entity != entityLogBookEntry {
+		return unsupported(op, entityLogBookEntry), nil
 	}
 	if op.BaseRevision == nil {
 		return Result{
@@ -318,7 +318,7 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 	err := t.tx.QueryRow(ctx,
 		`select s.revision, s.species_code, s.count::text, s.notes,
 		        to_jsonb(s) - 'location'
-		   from sighting s where s.id = $1`, op.EntityID).
+		   from log_book_entry s where s.id = $1`, op.EntityID).
 		Scan(&serverRevision, &serverSpecies, &serverCount, &serverNotes, &serverState)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The contract says an absent entity is treated as a create, but a
@@ -383,7 +383,7 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 	}
 
 	const q = `
-		update sighting set
+		update log_book_entry set
 		  revision          = revision + 1,
 		  -- the originals are written first and never cleared, so the record
 		  -- always shows both what was claimed and what it was corrected to
@@ -430,9 +430,9 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 // stops being a consistent snapshot, and a client can receive two revisions of
 // one record in one page and apply them the wrong way round.
 func (t *pgxTx) feed(ctx context.Context, caller Caller, op Operation, revision int64) error {
-	// The table is chosen from the entity rather than assumed to be sighting.
+	// The table is chosen from the entity rather than assumed to be the log book.
 	//
-	// Reading sighting for every operation meant a create of anything else
+	// Reading the log book for every operation meant a create of anything else
 	// returned no row, and a no-row error inside a transaction poisons it: the
 	// failure surfaced as "commit unexpectedly resulted in rollback" on an
 	// operation that had been applied, which is the worst of both — a client told
@@ -461,8 +461,8 @@ func (t *pgxTx) feed(ctx context.Context, caller Caller, op Operation, revision 
 // only ever reached through this map, so an entity with no arm is an error
 // before anything is built, not a query against whatever the client named.
 var feedTables = map[string]string{
-	"sighting": "sighting",
-	"outing":   "outing",
+	entityLogBookEntry: entityLogBookEntry,
+	"outing":           "outing",
 }
 
 func unsupported(op Operation, want string) Result {

@@ -39,6 +39,19 @@ import (
 	"time"
 )
 
+// entityLogBookEntry is the wire name for one entry in a trainee's log book.
+//
+// It was "sighting", which named only one thing a log holds. A log book also
+// holds a note, an identification query that came back empty, a reflection — and
+// the contract is explicit that a reflection cannot be verified, because it is not
+// a claim about the world. Calling the whole thing a sighting made that distinction
+// impossible to see from the wire.
+//
+// It is a constant rather than a literal at each use because the name appears in
+// the dispatch, in the error a client is given, and in the change feed, and those
+// three drifting apart is precisely what an unsupported-entity bug looks like.
+const entityLogBookEntry = "log_book_entry"
+
 // Outcome is what happened to one operation.
 type Outcome string
 

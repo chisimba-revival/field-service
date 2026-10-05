@@ -49,7 +49,7 @@ func (f *fakeStore) Page(_ context.Context, cursor int64, limit int) ([]pull.Cha
 
 func aChange(seq int64, note string) pull.Change {
 	return pull.Change{
-		Seq: seq, Entity: "sighting", EntityID: "e" + note, Revision: seq,
+		Seq: seq, Entity: "log_book_entry", EntityID: "e" + note, Revision: seq,
 		ChangedAt: time.Date(2026, 10, 4, 6, 0, 0, 0, time.UTC),
 		Body:      map[string]any{"notes": note},
 	}

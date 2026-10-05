@@ -25,7 +25,7 @@ import (
 func TestAValidCallerIsNotRefused(t *testing.T) {
 	r := start(t)
 	// Nothing has been published, so this is the empty-denylist case exactly.
-	status, body := r.push(r.token(0, "e2e-valid"), batch(r.sighting("e2e-valid")))
+	status, body := r.push(r.token(0, "e2e-valid"), batch(r.logBookEntry("e2e-valid")))
 	if status != http.StatusOK {
 		t.Fatalf("a valid caller was refused: %d %s", status, body)
 	}
@@ -57,10 +57,10 @@ func TestAStaleEpochIsRefusedAndTheCurrentOneIsNot(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.redis.Del(context.Background(), "revoked:"+subject).Err() })
 
-	if status, body := r.push(r.token(3, "e2e-stale"), batch(r.sighting("e2e-stale"))); status != http.StatusUnauthorized {
+	if status, body := r.push(r.token(3, "e2e-stale"), batch(r.logBookEntry("e2e-stale"))); status != http.StatusUnauthorized {
 		t.Errorf("a token below the published epoch must be refused: %d %s", status, body)
 	}
-	if status, body := r.push(r.token(7, "e2e-current"), batch(r.sighting("e2e-current"))); status != http.StatusOK {
+	if status, body := r.push(r.token(7, "e2e-current"), batch(r.logBookEntry("e2e-current"))); status != http.StatusOK {
 		t.Errorf("a token at the published epoch must be accepted: %d %s", status, body)
 	}
 }
@@ -73,7 +73,7 @@ func TestAStaleEpochIsRefusedAndTheCurrentOneIsNot(t *testing.T) {
 func TestTheWriteContextComesFromTheToken(t *testing.T) {
 	r := start(t)
 	const ctxCode = "e2e-token-context"
-	op := r.sighting(ctxCode)
+	op := r.logBookEntry(ctxCode)
 	// A field that is not on the wire at all. If the decoder were lax this would
 	// be ignored, and if it were strict the request would be refused — neither is
 	// the same as the sighting going somewhere the caller did not ask for.
@@ -91,7 +91,7 @@ func TestTheWriteContextComesFromTheToken(t *testing.T) {
 func TestOneResponseAndNoMore(t *testing.T) {
 	r := start(t)
 	tok := r.token(0, "e2e-mediatype")
-	body, _ := json.Marshal(batch(r.sighting("e2e-mediatype")))
+	body, _ := json.Marshal(batch(r.logBookEntry("e2e-mediatype")))
 
 	status, raw := r.pushRaw(tok, "text/plain", string(body))
 	if status != http.StatusUnsupportedMediaType {
@@ -115,7 +115,7 @@ func TestOneResponseAndNoMore(t *testing.T) {
 // look late when it is not.
 func TestCapturedAndRecordedAreDifferentFacts(t *testing.T) {
 	r := start(t)
-	op := r.sighting("e2e-times")
+	op := r.logBookEntry("e2e-times")
 	if status, body := r.push(r.token(0, "e2e-times"), batch(op)); status != http.StatusOK {
 		t.Fatalf("push: %d %s", status, body)
 	}
@@ -138,7 +138,7 @@ func TestCapturedAndRecordedAreDifferentFacts(t *testing.T) {
 // the dataset nobody can audit their way out of.
 func TestTheSameOperationTwiceIsOneRow(t *testing.T) {
 	r := start(t)
-	op := r.sighting("e2e-retry")
+	op := r.logBookEntry("e2e-retry")
 	first, body := r.push(r.token(0, "e2e-retry"), batch(op))
 	if first != http.StatusOK {
 		t.Fatalf("first push: %d %s", first, body)
@@ -163,9 +163,9 @@ func TestTheSameOperationTwiceIsOneRow(t *testing.T) {
 // for no reason anybody chose.
 func TestOneBadOperationDoesNotLoseTheGoodOnes(t *testing.T) {
 	r := start(t)
-	good := r.sighting("e2e-partial")
+	good := r.logBookEntry("e2e-partial")
 	var broken map[string]any
-	raw, _ := json.Marshal(r.sighting("e2e-partial"))
+	raw, _ := json.Marshal(r.logBookEntry("e2e-partial"))
 	_ = json.Unmarshal(raw, &broken)
 	delete(broken["payload"].(map[string]any), "outing_id")
 
@@ -198,7 +198,7 @@ func TestOneBadOperationDoesNotLoseTheGoodOnes(t *testing.T) {
 func TestAMissingScopeIsRefused(t *testing.T) {
 	r := start(t)
 	if status, _ := r.push(r.token(0, "e2e-noscope", "something:else"),
-		batch(r.sighting("e2e-noscope"))); status == http.StatusOK {
+		batch(r.logBookEntry("e2e-noscope"))); status == http.StatusOK {
 		t.Error("a token without the required scope was accepted")
 	}
 }
@@ -211,7 +211,7 @@ func TestAMissingScopeIsRefused(t *testing.T) {
 // is a sentence.
 func TestAnUnreadableTokenIsRefusedWithoutDescription(t *testing.T) {
 	r := start(t)
-	status, body := r.push("not.a.token", batch(r.sighting("e2e-junk")))
+	status, body := r.push("not.a.token", batch(r.logBookEntry("e2e-junk")))
 	if status != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", status)
 	}
@@ -230,7 +230,7 @@ func TestAnUnreadableTokenIsRefusedWithoutDescription(t *testing.T) {
 func TestPullReturnsWhatWasPushed(t *testing.T) {
 	r := start(t)
 	const ctxCode = "e2e-roundtrip"
-	op := r.sighting(ctxCode)
+	op := r.logBookEntry(ctxCode)
 	if status, body := r.push(r.token(0, ctxCode), batch(op)); status != http.StatusOK {
 		t.Fatalf("push: %d %s", status, body)
 	}
@@ -321,7 +321,7 @@ func TestAnOutingOutsideTheCallersContextIsRefused(t *testing.T) {
 	r := start(t)
 
 	t.Run("an outing that is not there", func(t *testing.T) {
-		op := r.sighting("e2e-nodrive")
+		op := r.logBookEntry("e2e-nodrive")
 		op["payload"].(map[string]any)["outing_id"] = "00000000-0000-4000-8000-000000000000"
 
 		status, body := r.push(r.token(0, "e2e-nodrive"), batch(op))
@@ -345,7 +345,7 @@ func TestAnOutingOutsideTheCallersContextIsRefused(t *testing.T) {
 	t.Run("a drive in another context", func(t *testing.T) {
 		// The drive genuinely exists, in a context this caller is not granted.
 		other := r.ensureOuting("e2e-other-context")
-		op := r.sighting("e2e-mine")
+		op := r.logBookEntry("e2e-mine")
 		op["payload"].(map[string]any)["outing_id"] = other
 
 		status, body := r.push(r.token(0, "e2e-mine"), batch(op))
@@ -362,7 +362,7 @@ func TestAnOutingOutsideTheCallersContextIsRefused(t *testing.T) {
 	})
 
 	t.Run("a drive in the caller's own context", func(t *testing.T) {
-		op := r.sighting("e2e-owncontext")
+		op := r.logBookEntry("e2e-owncontext")
 		status, body := r.push(r.token(0, "e2e-owncontext"), batch(op))
 		if status != http.StatusOK {
 			t.Fatalf("push: %d %s", status, body)

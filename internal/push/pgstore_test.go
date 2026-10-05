@@ -76,7 +76,7 @@ func asRuntime(t *testing.T, grants string, fn func(context.Context, *pgx.Conn))
 func reset(t *testing.T, conn *pgx.Conn) {
 	t.Helper()
 	_, err := conn.Exec(context.Background(),
-		`truncate change_feed, operation_outcome, media, trail_waypoint, trail_log, sighting, outing, drive_detail, hike_detail, camp_detail cascade`)
+		`truncate change_feed, operation_outcome, media, trail_waypoint, log_book_entry, outing, drive_detail, hike_detail, camp_detail cascade`)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -145,7 +145,7 @@ func uuidFor(name string) string {
 func aCreate(id, drive, species string, count int) push.Operation {
 	return push.Operation{
 		OperationID: uuidFor(id),
-		Entity:      "sighting",
+		Entity:      "log_book_entry",
 		Kind:        "create",
 		EntityID:    uuidFor(id),
 		CapturedAt:  time.Date(2026, 10, 4, 6, 14, 0, 0, time.UTC),
@@ -181,7 +181,7 @@ func TestACreateIsAppliedIntoTheCallersContext(t *testing.T) {
 
 	var ctxCode, species string
 	if err := conn.QueryRow(context.Background(),
-		`select context_code, species_code from sighting where id = $1`,
+		`select context_code, species_code from log_book_entry where id = $1`,
 		op.EntityID).Scan(&ctxCode, &species); err != nil {
 		t.Fatalf("reading back: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestACreateCannotBeDirectedIntoAnotherContextByItsPayload(t *testing.T) {
 
 	var ctxCode string
 	if err := conn.QueryRow(context.Background(),
-		`select context_code from sighting where id = $1`, op.EntityID).Scan(&ctxCode); err != nil {
+		`select context_code from log_book_entry where id = $1`, op.EntityID).Scan(&ctxCode); err != nil {
 		t.Fatal(err)
 	}
 	if ctxCode != ctxNorth {
@@ -274,7 +274,7 @@ func TestARetryOfACreateIsAppliedExactlyOnce(t *testing.T) {
 
 	var sightings, feeds, outcomes int
 	_ = conn.QueryRow(context.Background(),
-		`select count(*) from sighting where id = $1`, op.EntityID).Scan(&sightings)
+		`select count(*) from log_book_entry where id = $1`, op.EntityID).Scan(&sightings)
 	_ = adm.QueryRow(context.Background(),
 		`select count(*) from change_feed where entity_id = $1`, op.EntityID).Scan(&feeds)
 	_ = adm.QueryRow(context.Background(),
@@ -314,7 +314,7 @@ func TestTheEntityChangeAndItsOutcomeCommitTogetherOrNotAtAll(t *testing.T) {
 	}
 	var n int
 	if err := conn.QueryRow(context.Background(),
-		`select count(*) from sighting where id = $1`, atomicOp.EntityID).Scan(&n); err != nil {
+		`select count(*) from log_book_entry where id = $1`, atomicOp.EntityID).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
@@ -339,7 +339,7 @@ func TestACorrectionChangingACountWithoutAReasonIsRefused(t *testing.T) {
 
 	rev := int64(1)
 	correct := push.Operation{
-		OperationID: uuidFor("op-correct-noreason"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-correct-noreason"), Entity: "log_book_entry", Kind: "correct",
 		EntityID:     create.EntityID,
 		BaseRevision: &rev,
 		Payload:      map[string]any{"count": 4}, // no reason
@@ -371,7 +371,7 @@ func TestACorrectionRetainsTheOriginalClaimBesideTheCorrection(t *testing.T) {
 
 	rev := int64(1)
 	correct := push.Operation{
-		OperationID: uuidFor("op-correct-ok"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-correct-ok"), Entity: "log_book_entry", Kind: "correct",
 		EntityID: create.EntityID, BaseRevision: &rev,
 		Payload: map[string]any{
 			"count": 4, "correction_reason": "Seven on the first count, four on the second.",
@@ -394,7 +394,7 @@ func TestACorrectionRetainsTheOriginalClaimBesideTheCorrection(t *testing.T) {
 	var species, recordedSpecies, reason *string
 	if err := conn.QueryRow(context.Background(),
 		`select count, recorded_count, species_code, recorded_species_code, correction_reason
-		   from sighting where id = $1`, create.EntityID).
+		   from log_book_entry where id = $1`, create.EntityID).
 		Scan(&count, &recordedCount, &species, &recordedSpecies, &reason); err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,7 @@ func TestACorrectionAgainstAStaleRevisionIsRefusedWithBothSidesKept(t *testing.T
 	// Somebody else corrects it first.
 	first := int64(1)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
-		OperationID: uuidFor("op-other-1"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-other-1"), Entity: "log_book_entry", Kind: "correct",
 		EntityID: create.EntityID, BaseRevision: &first,
 		Payload: map[string]any{"count": 3, "correction_reason": "Recounted."},
 	}}); err != nil {
@@ -436,7 +436,7 @@ func TestACorrectionAgainstAStaleRevisionIsRefusedWithBothSidesKept(t *testing.T
 	// Our device was offline and still believes revision 1.
 	stale := int64(1)
 	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
-		OperationID: uuidFor("op-stale-1"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-stale-1"), Entity: "log_book_entry", Kind: "correct",
 		EntityID: create.EntityID, BaseRevision: &stale,
 		Payload: map[string]any{"count": 9, "correction_reason": "I counted nine."},
 	}})
@@ -469,7 +469,7 @@ func TestACorrectionOfAnAbsentRecordIsRefusedRatherThanCreated(t *testing.T) {
 	svc, _ := service(t, ctxNorth)
 	rev := int64(0)
 	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
-		OperationID: uuidFor("op-ghost-1"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-ghost-1"), Entity: "log_book_entry", Kind: "correct",
 		EntityID: uuidFor("ghost"), BaseRevision: &rev,
 		Payload: map[string]any{"count": 4, "correction_reason": "x"},
 	}})
@@ -516,7 +516,7 @@ func TestAnUnknownKindIsRefusedRatherThanDeferredForever(t *testing.T) {
 
 	svc, _ := service(t, ctxNorth)
 	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
-		OperationID: uuidFor("op-unknown-1"), Entity: "sighting", Kind: "obliterate",
+		OperationID: uuidFor("op-unknown-1"), Entity: "log_book_entry", Kind: "obliterate",
 		EntityID: uuidFor("obliterate"),
 	}})
 	if err != nil {
@@ -569,7 +569,7 @@ func TestARefusalInABatchDoesNotUndoTheOthers(t *testing.T) {
 	svc, conn := service(t, ctxNorth)
 	good := aCreate("op-batch-1", outingNorth, "LEOP", 1)
 	ghost := push.Operation{
-		OperationID: uuidFor("op-batch-ghost"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-batch-ghost"), Entity: "log_book_entry", Kind: "correct",
 		EntityID: uuidFor("ghost"), BaseRevision: ptr(int64(1)),
 		Payload: map[string]any{"count": 4, "correction_reason": "x"},
 	}
@@ -586,7 +586,7 @@ func TestARefusalInABatchDoesNotUndoTheOthers(t *testing.T) {
 	for _, op := range []push.Operation{good, later} {
 		var n int
 		if err := conn.QueryRow(context.Background(),
-			`select count(*) from sighting where id = $1`, op.EntityID).Scan(&n); err != nil {
+			`select count(*) from log_book_entry where id = $1`, op.EntityID).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n != 1 {
@@ -610,7 +610,7 @@ func TestASparseCorrectionLeavesUnmentionedFieldsAlone(t *testing.T) {
 
 	rev := int64(1)
 	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
-		OperationID: uuidFor("op-sparse-corr"), Entity: "sighting", Kind: "correct",
+		OperationID: uuidFor("op-sparse-corr"), Entity: "log_book_entry", Kind: "correct",
 		EntityID: create.EntityID, BaseRevision: &rev,
 		Payload: map[string]any{"count": 3, "correction_reason": "Three, not five."},
 	}}); err != nil {
@@ -619,7 +619,7 @@ func TestASparseCorrectionLeavesUnmentionedFieldsAlone(t *testing.T) {
 
 	var species, notes string
 	if err := conn.QueryRow(context.Background(),
-		`select species_code, notes from sighting where id = $1`, create.EntityID).
+		`select species_code, notes from log_book_entry where id = $1`, create.EntityID).
 		Scan(&species, &notes); err != nil {
 		t.Fatal(err)
 	}
@@ -753,7 +753,7 @@ func TestCapturedAndRecordedTimesAreNotTheSameFact(t *testing.T) {
 
 	var gotCaptured, gotRecorded time.Time
 	if err := conn.QueryRow(context.Background(),
-		`select captured_at, recorded_at from sighting s where s.id = $1`,
+		`select captured_at, recorded_at from log_book_entry s where s.id = $1`,
 		op.EntityID).Scan(&gotCaptured, &gotRecorded); err != nil {
 		t.Fatal(err)
 	}

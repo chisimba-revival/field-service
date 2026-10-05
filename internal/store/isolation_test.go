@@ -90,7 +90,7 @@ func seed(t *testing.T, conn *pgx.Conn) {
 	// trail_waypoint and media, which reference drive and sighting, so a
 	// bare truncate of the two original tables is refused. Found by running
 	// these tests after 0003, which is the only place it could be found.
-	if _, err := conn.Exec(ctx, `truncate outing, sighting, trail_log, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
+	if _, err := conn.Exec(ctx, `truncate outing, log_book_entry, trail_waypoint, change_feed, media, operation_outcome cascade`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	for i, d := range []struct{ id, context, guide string }{
@@ -104,7 +104,7 @@ func seed(t *testing.T, conn *pgx.Conn) {
 			t.Fatalf("insert drive %s: %v", d.context, err)
 		}
 		if _, err := conn.Exec(ctx,
-			`insert into sighting (id, context_code, outing_id, location,
+			`insert into log_book_entry (id, context_code, outing_id, location,
 			   captured_at, recorded_at, created_by, species_code)
 			 values ($1, $2, $3, st_setsrid(st_makepoint($4, $5), 4326),
 			         now(), now(), $6, 'LEOP')`,
@@ -136,7 +136,7 @@ func sightingsVisibleIn(ctx context.Context, conn *pgx.Conn, grants string) (int
 		return 0, err
 	}
 	var n int
-	if err := tx.QueryRow(ctx, `select count(*) from sighting`).Scan(&n); err != nil {
+	if err := tx.QueryRow(ctx, `select count(*) from log_book_entry`).Scan(&n); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -153,7 +153,7 @@ func TestTheRuntimeRoleIsSubjectToThePolicies(t *testing.T) {
 	var readErr error
 	asRuntime(t, func(ctx context.Context, conn *pgx.Conn) {
 		var n int
-		readErr = conn.QueryRow(ctx, `select count(*) from sighting`).Scan(&n)
+		readErr = conn.QueryRow(ctx, `select count(*) from log_book_entry`).Scan(&n)
 	})
 	if readErr == nil {
 		t.Fatal("the runtime role read the table with no grants set at all. The " +
@@ -221,7 +221,7 @@ func TestTheReadBoundaryIsTheGrantSetNotTheActiveContext(t *testing.T) {
 					return
 				}
 				rows, e := tx.Query(ctx,
-					`select context_code from sighting order by context_code`)
+					`select context_code from log_book_entry order by context_code`)
 				if e != nil {
 					err = e
 					return
@@ -277,7 +277,7 @@ func TestSetLocalRevertsAndPlainSetDoesNot(t *testing.T) {
 		// PostgreSQL keeps the placeholder defined and empty, so the read
 		// succeeds and matches nothing. Zero rows is the safe outcome; two would
 		// mean the grant survived the commit.
-		localErr = conn.QueryRow(ctx, `select count(*) from sighting`).Scan(&afterLocal)
+		localErr = conn.QueryRow(ctx, `select count(*) from log_book_entry`).Scan(&afterLocal)
 
 		// A plain set is expected to persist. Asserted because it is the failure
 		// the design warns about: if this ever stopped being true the warning
@@ -289,7 +289,7 @@ func TestSetLocalRevertsAndPlainSetDoesNot(t *testing.T) {
 			`select set_config('app.context_grants', $1, false)`, ctxNorth); err != nil {
 			t.Fatalf("plain set: %v", err)
 		}
-		plainErr = conn.QueryRow(ctx, `select count(*) from sighting`).Scan(&afterPlain)
+		plainErr = conn.QueryRow(ctx, `select count(*) from log_book_entry`).Scan(&afterPlain)
 	})
 
 	if localErr == nil && afterLocal != 0 {
@@ -326,7 +326,7 @@ func TestWritingIntoAnUngrantedContextIsRefused(t *testing.T) {
 			return
 		}
 		_, writeErr = tx.Exec(ctx,
-			`insert into sighting (id, context_code, outing_id, location,
+			`insert into log_book_entry (id, context_code, outing_id, location,
 			   captured_at, recorded_at, created_by)
 			 values ('bbbbbbbb-0000-0000-0000-000000000001', $1, $2,
 			         st_setsrid(st_makepoint(36.9, -1.3), 4326),
@@ -348,7 +348,7 @@ func TestTheRuntimeRoleCannotDisableThePolicies(t *testing.T) {
 	var alterErr error
 	asRuntime(t, func(ctx context.Context, conn *pgx.Conn) {
 		_, alterErr = conn.Exec(ctx,
-			`alter table sighting disable row level security`)
+			`alter table log_book_entry disable row level security`)
 	})
 	if alterErr == nil {
 		t.Fatal("the runtime role disabled row-level security on a table it uses. " +
@@ -379,7 +379,7 @@ func TestAnAbsentCountIsNotAZero(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := conn.Exec(ctx,
-				`insert into sighting (id, context_code, outing_id, location, count,
+				`insert into log_book_entry (id, context_code, outing_id, location, count,
 				   captured_at, recorded_at, created_by)
 				 values (gen_random_uuid(), $1, $2,
 				         st_setsrid(st_makepoint(36.8, -1.2), 4326), $3,
@@ -400,7 +400,7 @@ func TestACorrectionWithoutAReasonIsRefused(t *testing.T) {
 	seed(t, conn)
 
 	_, err := conn.Exec(context.Background(),
-		`insert into sighting (id, context_code, outing_id, location, species_code,
+		`insert into log_book_entry (id, context_code, outing_id, location, species_code,
 		   recorded_species_code, captured_at, recorded_at, created_by)
 		 values (gen_random_uuid(), $1, $2,
 		         st_setsrid(st_makepoint(36.8, -1.2), 4326), 'LION', 'LEOP',
@@ -488,7 +488,7 @@ func TestTheMigrationRoleBypassesThePoliciesAndMustNotBeUsedAtRuntime(t *testing
 	}
 
 	var n int
-	err := conn.QueryRow(ctx, `select count(*) from sighting`).Scan(&n)
+	err := conn.QueryRow(ctx, `select count(*) from log_book_entry`).Scan(&n)
 	switch {
 	case err == nil && isSuper:
 		t.Logf("the migration role is a superuser and read all %d rows with no "+

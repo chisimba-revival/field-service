@@ -385,10 +385,10 @@ func (r *rig) ensureOuting(ctx string) string {
 	return id
 }
 
-func (r *rig) sighting(ctx string) map[string]any {
+func (r *rig) logBookEntry(ctx string) map[string]any {
 	return map[string]any{
 		"operation_id":  newID(),
-		"entity":        "sighting",
+		"entity":        "log_book_entry",
 		"kind":          "create",
 		"entity_id":     newID(),
 		"base_revision": nil,
@@ -449,7 +449,7 @@ func assertRow(t *testing.T, r *rig, entityID, wantContext, wantCreator string) 
 	t.Helper()
 	var gotContext, gotCreator string
 	err := r.pool.QueryRow(context.Background(),
-		`select context_code, created_by from sighting where id = $1`, entityID).
+		`select context_code, created_by from log_book_entry where id = $1`, entityID).
 		Scan(&gotContext, &gotCreator)
 	if err != nil {
 		t.Fatalf("no sighting for %s: %v", entityID, err)
@@ -467,7 +467,7 @@ func assertRow(t *testing.T, r *rig, entityID, wantContext, wantCreator string) 
 func (r *rig) timestamps(t *testing.T, entityID string) (captured, recorded time.Time) {
 	t.Helper()
 	err := r.pool.QueryRow(context.Background(),
-		`select captured_at, recorded_at from sighting where id = $1`, entityID).
+		`select captured_at, recorded_at from log_book_entry where id = $1`, entityID).
 		Scan(&captured, &recorded)
 	if err != nil {
 		t.Fatalf("no sighting for %s: %v", entityID, err)
@@ -479,7 +479,7 @@ func (r *rig) countRows(t *testing.T, entityID string) int {
 	t.Helper()
 	var n int
 	if err := r.pool.QueryRow(context.Background(),
-		`select count(*) from sighting where id = $1`, entityID).Scan(&n); err != nil {
+		`select count(*) from log_book_entry where id = $1`, entityID).Scan(&n); err != nil {
 		t.Fatalf("count for %s: %v", entityID, err)
 	}
 	return n

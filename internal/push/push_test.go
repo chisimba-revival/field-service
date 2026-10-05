@@ -99,7 +99,7 @@ func anOperation(id string) push.Operation {
 	rev := int64(3)
 	return push.Operation{
 		OperationID:  id,
-		Entity:       "sighting",
+		Entity:       "log_book_entry",
 		Kind:         "create",
 		EntityID:     "entity-" + id,
 		BaseRevision: &rev,
@@ -176,7 +176,7 @@ func TestARetryReturnsTheOriginallyRecordedOutcomeNotAFreshEvaluation(t *testing
 func TestARetryOfARefusalIsRefusedAgainRatherThanReevaluated(t *testing.T) {
 	tx := newTx()
 	refused := push.Result{
-		OperationID: "op-1", Entity: "sighting", EntityID: "entity-op-1",
+		OperationID: "op-1", Entity: "log_book_entry", EntityID: "entity-op-1",
 		Outcome: push.OutcomeRefused, ErrorCode: "revision_conflict",
 		ServerState: map[string]any{"count": 4},
 	}
@@ -230,7 +230,7 @@ func TestARecordedOutcomeBelongsToTheCallerWhoEarnedIt(t *testing.T) {
 func TestARefusedOperationDoesNotDiscardTheRestOfTheBatch(t *testing.T) {
 	tx := newTx()
 	tx.recorded["user-1\x00op-2"] = push.Result{
-		OperationID: "op-2", Entity: "sighting", EntityID: "entity-op-2",
+		OperationID: "op-2", Entity: "log_book_entry", EntityID: "entity-op-2",
 		Outcome: push.OutcomeRefused, ErrorCode: "revision_conflict",
 	}
 
