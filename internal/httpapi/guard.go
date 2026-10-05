@@ -75,7 +75,8 @@ type RevocationChecker interface {
 // for the transaction and lets them revert at its end, which is why a pooled
 // connection cannot hand one caller's grants to the next.
 type Session interface {
-	InTx(ctx context.Context, grants []string, fn func(context.Context) error) error
+	InTx(ctx context.Context, callerID string, grants []string,
+		fn func(context.Context) error) error
 }
 
 // Logger records why a request was refused.
@@ -206,9 +207,10 @@ func (g *Guard) Serve(h Handler) http.Handler {
 		// The grant set, not the active context. A write into the caller's active
 		// context happens because that is where the record belongs, but the read
 		// boundary is everywhere they were granted.
-		if err := g.session.InTx(r.Context(), grants, func(ctx context.Context) error {
-			return h(w, r, caller)
-		}); err != nil {
+		if err := g.session.InTx(r.Context(), caller.Subject(), grants,
+			func(ctx context.Context) error {
+				return h(w, r, caller)
+			}); err != nil {
 			// The caller was authorised. A handler that fails is an internal
 			// fault and must not be reported as an authorisation problem, or the
 			// logs will say "unauthorised" about requests that were permitted.

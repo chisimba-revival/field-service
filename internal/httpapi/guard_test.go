@@ -95,13 +95,16 @@ func (f *fakeChecker) Revoked(_ context.Context, subject string, issuedAt time.T
 // recordingSession records the grants it was handed and whether the handler ran.
 type recordingSession struct {
 	mu           sync.Mutex
+	callerID     string
 	grants       []string
 	handlerRan   bool
 	returnErr    error
 	transactions int
 }
 
-func (s *recordingSession) InTx(_ context.Context, grants []string, fn func(context.Context) error) error {
+func (s *recordingSession) InTx(_ context.Context, callerID string, grants []string,
+	fn func(context.Context) error) error {
+	s.callerID = callerID
 	s.mu.Lock()
 	s.transactions++
 	s.grants = append([]string(nil), grants...)

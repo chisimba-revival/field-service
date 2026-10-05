@@ -150,7 +150,7 @@ func TestTheGrantsAreSetInsideTheTransactionAndBeforeTheHandlerRuns(t *testing.T
 	s := NewSession(&fakePool{tx: tx})
 
 	ranAfterSetting := false
-	err := s.InTx(context.Background(), []string{"northern", "southern"},
+	err := s.InTx(context.Background(), "user-1", []string{"northern", "southern"},
 		func(context.Context) error {
 			ranAfterSetting = len(tx.statements) > 0 &&
 				strings.Contains(tx.statements[0], "set_config")
@@ -177,7 +177,7 @@ func TestTheGrantsAreBoundRatherThanInterpolated(t *testing.T) {
 	tx := &fakeTx{}
 	s := NewSession(&fakePool{tx: tx})
 
-	if err := s.InTx(context.Background(), []string{"northern"}, func(context.Context) error {
+	if err := s.InTx(context.Background(), "user-1", []string{"northern"}, func(context.Context) error {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -217,7 +217,7 @@ func TestAMalformedContextCodeIsRefusedRatherThanSilentlyDropped(t *testing.T) {
 		{"northern,southern"},
 		{"northern", ""},
 	} {
-		err := s.InTx(context.Background(), grants, func(context.Context) error {
+		err := s.InTx(context.Background(), "user-1", grants, func(context.Context) error {
 			t.Error("the handler ran despite a malformed grant set")
 			return nil
 		})
@@ -237,7 +237,7 @@ func TestAnEmptyGrantSetIsRefusedBeforeAnyStatementRuns(t *testing.T) {
 	tx := &fakeTx{}
 	s := NewSession(&fakePool{tx: tx})
 
-	err := s.InTx(context.Background(), nil, func(context.Context) error {
+	err := s.InTx(context.Background(), "user-1", nil, func(context.Context) error {
 		t.Error("the handler ran with no grants")
 		return nil
 	})
@@ -256,7 +256,7 @@ func TestAFailedHandlerRollsBackRatherThanCommits(t *testing.T) {
 	s := NewSession(&fakePool{tx: tx})
 
 	sentinel := errors.New("write failed")
-	err := s.InTx(context.Background(), []string{"northern"},
+	err := s.InTx(context.Background(), "user-1", []string{"northern"},
 		func(context.Context) error { return sentinel })
 	if !errors.Is(err, sentinel) {
 		t.Errorf("the handler's error did not come back: %v", err)
@@ -298,3 +298,92 @@ func TestRevocationCheckerNeedsNoAdapter(t *testing.T) {
 type staticKeys struct{}
 
 func (staticKeys) ResolveKey(string) (*rsa.PublicKey, error) { return nil, nil }
+
+// The caller setting is not a nicety. operation_outcome's policy compares its
+// caller column against this identifier, so a transaction that does not set it
+// cannot read or write that table at all — and the failure presents as an
+// operation outcome that is mysteriously never found, which is a very quiet
+// wrong answer.
+func TestTheCallersOwnIdentityIsSetInsideTheTransaction(t *testing.T) {
+	tx := &fakeTx{}
+	s := NewSession(&fakePool{tx: tx})
+
+	if err := s.InTx(context.Background(), "user-42", []string{"northern"},
+		func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("InTx: %v", err)
+	}
+
+	found := false
+	for i, stmt := range tx.statements {
+		if !strings.Contains(stmt, "set_config") {
+			continue
+		}
+		args := tx.args[i]
+		if len(args) != 2 {
+			t.Fatalf("set_config executed with %d bound arguments", len(args))
+		}
+		if args[0] == callerSetting {
+			found = true
+			if args[1] != "user-42" {
+				t.Errorf("%s = %v, want the caller's own id", callerSetting, args[1])
+			}
+			if !strings.Contains(stmt, "true") {
+				t.Errorf("%s was not set transaction-locally: %s", callerSetting, stmt)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("%s was never set, so operation_outcome is unreachable", callerSetting)
+	}
+}
+
+// Bound, not interpolated, for the same reason the grants are: the value comes
+// from a token and this is the place that decides whose outcomes are readable.
+func TestTheCallerSettingIsBoundRatherThanInterpolated(t *testing.T) {
+	tx := &fakeTx{}
+	s := NewSession(&fakePool{tx: tx})
+
+	nasty := "user-42'; drop table sighting; --"
+	if err := s.InTx(context.Background(), nasty, []string{"northern"},
+		func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("InTx: %v", err)
+	}
+
+	passedIntact := false
+	for _, stmt := range tx.statements {
+		if strings.Contains(stmt, "drop table") {
+			t.Fatalf("the caller id reached the statement text: %s", stmt)
+		}
+	}
+	for i, args := range tx.args {
+		if len(args) == 2 && args[0] == callerSetting && args[1] == nasty {
+			passedIntact = true
+			_ = tx.statements[i]
+		}
+	}
+	if !passedIntact {
+		t.Error("the caller id did not arrive intact as a bound argument, so it " +
+			"was either interpolated or dropped")
+	}
+}
+
+// A transaction opened for nobody is refused up front. Left to the first query
+// touching operation_outcome it would fail with an obscure error instead, and
+// the caller would have no way to tell which of their two inputs was at fault.
+func TestATransactionForNobodyIsRefused(t *testing.T) {
+	tx := &fakeTx{}
+	s := NewSession(&fakePool{tx: tx})
+
+	err := s.InTx(context.Background(), "   ", []string{"northern"},
+		func(context.Context) error {
+			t.Error("the handler ran for a transaction with no caller")
+			return nil
+		})
+	if !errors.Is(err, ErrNoCaller) {
+		t.Errorf("err = %v, want ErrNoCaller", err)
+	}
+	if len(tx.statements) != 0 {
+		t.Errorf("%d statements ran for a transaction with no caller, which is "+
+			"what the check exists to prevent", len(tx.statements))
+	}
+}

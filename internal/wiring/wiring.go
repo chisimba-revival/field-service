@@ -11,6 +11,7 @@ package wiring
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"field-service/internal/authn"
@@ -89,6 +90,14 @@ func (c claims) IssuedAt() (time.Time, bool) {
 // that looks like a correct answer to a query that should have returned rows.
 var ErrNoGrants = errors.New("wiring: refusing to run a transaction with no context grants")
 
+// ErrNoCaller is returned when a transaction is opened for nobody.
+//
+// operation_outcome's policy compares its caller column against this
+// identifier, so a transaction with no caller cannot read or write that table
+// at all. Refusing up front says so plainly rather than letting the first query
+// that touches it fail with an obscure error.
+var ErrNoCaller = errors.New("wiring: refusing to run a transaction with no caller")
+
 // PgxSession runs a transaction whose read boundary is the caller's grant set.
 //
 // This is where the isolation becomes real for a request. The guard has already
@@ -144,6 +153,12 @@ var _ httpapi.Session = (*PgxSession)(nil)
 // and would present as an unexplained empty result in production.
 const grantsSetting = "app.context_grants"
 
+// callerSetting is a constant for the same reason grantsSetting is, and it is
+// here for the same reason: a typo here does not error, so it would be set and
+// never read, and the one table whose policy depends on it would refuse every
+// row. That presents as an operation outcome that is mysteriously never found.
+const callerSetting = "app.caller_user_id"
+
 // InTx runs fn inside a transaction whose visibility is the given grants.
 //
 // Three details that are not interchangeable with their alternatives.
@@ -162,7 +177,13 @@ const grantsSetting = "app.context_grants"
 // makes the policies match no context, so the transaction would see nothing
 // rather than everything — safe, but silently, and it converts a caller's mistake
 // into an empty answer that looks correct.
-func (s *PgxSession) InTx(ctx context.Context, grants []string, fn func(context.Context) error) error {
+// InTx runs fn inside a transaction whose visibility is the given grants, and
+// whose caller identity is the given user.
+func (s *PgxSession) InTx(ctx context.Context, callerID string, grants []string,
+	fn func(context.Context) error) error {
+	if strings.TrimSpace(callerID) == "" {
+		return ErrNoCaller
+	}
 	if len(grants) == 0 {
 		return ErrNoGrants
 	}
@@ -182,6 +203,11 @@ func (s *PgxSession) InTx(ctx context.Context, grants []string, fn func(context.
 
 	if _, err := tx.Exec(ctx,
 		`select set_config($1, $2, true)`, grantsSetting, rendered); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`select set_config($1, $2, true)`, callerSetting, callerID); err != nil {
 		return err
 	}
 
