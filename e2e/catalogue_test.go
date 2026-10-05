@@ -107,13 +107,24 @@ func TestTheCatalogueIsSearchableByCode(t *testing.T) {
 		t.Fatalf("expected the reserve's catalogue, got %d entries: %v", len(all), all)
 	}
 
-	// Lowercase on purpose. A device holding a cached code will send it back
+	// BUFA and WHRI, and not LEOP.
+	//
+	// This test first used LEOP, and passed with the code column removed from
+	// the query — because "Leopard" contains "leop", so the search was matching
+	// the common name and the code column was never exercised. A test asserting a
+	// code must therefore use a code that appears in no name, description or
+	// scientific name, or it asserts nothing about the column it is named after.
+	//
+	// Lowercase on purpose as well. A device holding a cached code sends it back
 	// exactly as it holds it, and a catalogue that loses a species to a case
 	// difference looks like one that has forgotten it.
-	for _, term := range []string{"LEOP", "leop"} {
-		got := searchCatalogue(t, r, tok, term)
-		if len(got) != 1 || got[0] != "LEOP" {
-			t.Fatalf("search %q returned %v, want [LEOP]", term, got)
+	for _, c := range []struct{ term, code string }{
+		{"BUFA", "BUFA"}, {"bufa", "BUFA"},
+		{"WHRI", "WHRI"}, {"whri", "WHRI"},
+	} {
+		got := searchCatalogue(t, r, tok, c.term)
+		if len(got) != 1 || got[0] != c.code {
+			t.Fatalf("search %q returned %v, want [%s]", c.term, got, c.code)
 		}
 	}
 }
