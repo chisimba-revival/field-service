@@ -80,6 +80,14 @@ var (
 	// and saying so up front beats writing an outcome row nobody can read.
 	ErrNoCaller = errors.New("push: no caller")
 
+	// ErrNoWriteContext is returned when the caller's token names no active
+	// context.
+	//
+	// Refused rather than defaulted. Defaulting would mean inventing a context,
+	// and a record written into an invented context is invisible to every guide
+	// who actually holds that grant.
+	ErrNoWriteContext = errors.New("push: token carries no active context")
+
 	// ErrNoOperations is returned for an empty batch.
 	//
 	// Rejected rather than answered with an empty success, because a client
@@ -124,6 +132,12 @@ type Result struct {
 	// its local row without a second round trip.
 	NewRevision int64 `json:"new_revision,omitempty"`
 
+	// ServerRevision is the revision the server actually holds, sent with a
+	// conflict. The contract requires the current server state and revision
+	// alongside the client's submitted values so the two can be compared; a
+	// client told only that a conflict occurred has nothing to decide with.
+	ServerRevision int64 `json:"server_revision,omitempty"`
+
 	// ErrorCode is a stable machine-readable word. The client branches on it;
 	// humans never see it, because a raw code on a phone at a waterhole is a
 	// shrug rather than a message.
@@ -134,6 +148,34 @@ type Result struct {
 	ServerState map[string]any `json:"server_state,omitempty"`
 	ClientState map[string]any `json:"client_state,omitempty"`
 }
+
+// Caller is who is pushing, and where a new record goes.
+//
+// This is a value rather than a set of strings so that the rule about context
+// cannot be got wrong by forgetting a parameter. Rule 11 needs both a scope and
+// a grant in a context; writes then go into the caller's ACTIVE context, which
+// is a third thing again. Handing a push three loose strings invites the caller
+// to pass the grant set where the write context belongs, and the result would be
+// records written into a context the token never named.
+type Caller struct {
+	// ID is the Chisimba user id, unchanged. Rule 2 is explicit: no surrogate
+	// keys and no re-mapping.
+	ID string
+
+	// WriteContext is the token's active context. A new record goes here and
+	// nowhere else. Operation has no context field at all, so a client cannot
+	// write into a context it was not granted — there is nowhere to put one,
+	// which is the property being relied on rather than an omission.
+	WriteContext string
+}
+
+// usable reports whether this caller can be recorded at all.
+//
+// Both fields are required and for different reasons. A caller with no id
+// cannot own an outcome row. A caller with no active context cannot be granted
+// one either: the contract has a record's context come from the token, so a
+// token carrying none is not a caller who may write.
+func (c Caller) usable() bool { return c.ID != "" && c.WriteContext != "" }
 
 // Store is the database work a push needs.
 //
@@ -153,11 +195,11 @@ type Store interface {
 type Tx interface {
 	// RecordedOutcome returns the outcome previously recorded for this caller
 	// and operation id, or false if there is none.
-	RecordedOutcome(ctx context.Context, caller, operationID string) (Result, bool, error)
+	RecordedOutcome(ctx context.Context, callerID, operationID string) (Result, bool, error)
 
 	// Apply performs one operation and records its outcome. Both writes MUST
 	// happen in this transaction.
-	Apply(ctx context.Context, caller string, op Operation) (Result, error)
+	Apply(ctx context.Context, caller Caller, op Operation) (Result, error)
 
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
@@ -182,9 +224,12 @@ func New(store Store) *Service { return &Service{store: store} }
 // of them to survive. The thing that must never be half-done is a single
 // operation — its entity change and its outcome row — which is why both live in
 // the transaction this method opens.
-func (s *Service) Push(ctx context.Context, caller string, ops []Operation) ([]Result, error) {
-	if caller == "" {
+func (s *Service) Push(ctx context.Context, caller Caller, ops []Operation) ([]Result, error) {
+	if caller.ID == "" {
 		return nil, ErrNoCaller
+	}
+	if caller.WriteContext == "" {
+		return nil, ErrNoWriteContext
 	}
 	if len(ops) == 0 {
 		return nil, ErrNoOperations
@@ -213,7 +258,7 @@ func (s *Service) Push(ctx context.Context, caller string, ops []Operation) ([]R
 }
 
 // one applies a single operation, honouring a recorded outcome if there is one.
-func (s *Service) one(ctx context.Context, tx Tx, caller string, op Operation) Result {
+func (s *Service) one(ctx context.Context, tx Tx, caller Caller, op Operation) Result {
 	if op.OperationID == "" {
 		return Result{
 			Entity: op.Entity, EntityID: op.EntityID,
@@ -222,7 +267,7 @@ func (s *Service) one(ctx context.Context, tx Tx, caller string, op Operation) R
 		}
 	}
 
-	recorded, found, err := tx.RecordedOutcome(ctx, caller, op.OperationID)
+	recorded, found, err := tx.RecordedOutcome(ctx, caller.ID, op.OperationID)
 	if err != nil {
 		// The outcome table could not be read. Deferring rather than refusing is
 		// the right direction: this operation may already have been applied, and

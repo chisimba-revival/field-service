@@ -41,6 +41,9 @@ func newTx() *fakeTx {
 	return &fakeTx{recorded: map[string]push.Result{}}
 }
 
+// aCaller is the caller every test uses unless it is testing the caller itself.
+func aCaller() push.Caller { return push.Caller{ID: "user-1", WriteContext: "reserve-north"} }
+
 func (f *fakeTx) Begin(context.Context) (push.Tx, error) {
 	if f.beginErr != nil {
 		return nil, f.beginErr
@@ -48,15 +51,15 @@ func (f *fakeTx) Begin(context.Context) (push.Tx, error) {
 	return f, nil
 }
 
-func (f *fakeTx) RecordedOutcome(_ context.Context, caller, operationID string) (push.Result, bool, error) {
+func (f *fakeTx) RecordedOutcome(_ context.Context, callerID, operationID string) (push.Result, bool, error) {
 	if f.readErr != nil {
 		return push.Result{}, false, f.readErr
 	}
-	r, ok := f.recorded[caller+"\x00"+operationID]
+	r, ok := f.recorded[callerID+"\x00"+operationID]
 	return r, ok, nil
 }
 
-func (f *fakeTx) Apply(_ context.Context, caller string, op push.Operation) (push.Result, error) {
+func (f *fakeTx) Apply(_ context.Context, caller push.Caller, op push.Operation) (push.Result, error) {
 	f.applyCalls++
 	if f.applyErr != nil {
 		return push.Result{}, f.applyErr
@@ -77,7 +80,7 @@ func (f *fakeTx) Apply(_ context.Context, caller string, op push.Operation) (pus
 	// A real store records the outcome here, in this transaction. Reproducing
 	// that is the point of the fake: without it, a test could pass while the
 	// replay rule was never exercised.
-	f.recorded[caller+"\x00"+op.OperationID] = res
+	f.recorded[caller.ID+"\x00"+op.OperationID] = res
 	return res, nil
 }
 
@@ -110,7 +113,7 @@ func aService(tx *fakeTx) *push.Service { return push.New(fakeStore{tx: tx}) }
 // A successful push returns one result per operation, in the order sent.
 func TestAPushReturnsOneResultPerOperationInOrder(t *testing.T) {
 	tx := newTx()
-	got, err := aService(tx).Push(context.Background(), "user-1", []push.Operation{
+	got, err := aService(tx).Push(context.Background(), aCaller(), []push.Operation{
 		anOperation("op-1"), anOperation("op-2"), anOperation("op-3"),
 	})
 	if err != nil {
@@ -141,7 +144,7 @@ func TestARetryReturnsTheOriginallyRecordedOutcomeNotAFreshEvaluation(t *testing
 	svc := aService(tx)
 	ctx := context.Background()
 
-	first, err := svc.Push(ctx, "user-1", []push.Operation{anOperation("op-1")})
+	first, err := svc.Push(ctx, aCaller(), []push.Operation{anOperation("op-1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +158,7 @@ func TestARetryReturnsTheOriginallyRecordedOutcomeNotAFreshEvaluation(t *testing
 	retry := anOperation("op-1")
 	retry.Payload = map[string]any{"species_code": "LION", "count": 9}
 
-	second, err := svc.Push(ctx, "user-1", []push.Operation{retry})
+	second, err := svc.Push(ctx, aCaller(), []push.Operation{retry})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +182,7 @@ func TestARetryOfARefusalIsRefusedAgainRatherThanReevaluated(t *testing.T) {
 	}
 	tx.recorded["user-1\x00op-1"] = refused
 
-	got, err := aService(tx).Push(context.Background(), "user-1",
+	got, err := aService(tx).Push(context.Background(), aCaller(),
 		[]push.Operation{anOperation("op-1")})
 	if err != nil {
 		t.Fatal(err)
@@ -201,14 +204,14 @@ func TestARecordedOutcomeBelongsToTheCallerWhoEarnedIt(t *testing.T) {
 	svc := aService(tx)
 	ctx := context.Background()
 
-	if _, err := svc.Push(ctx, "user-1", []push.Operation{anOperation("op-1")}); err != nil {
+	if _, err := svc.Push(ctx, aCaller(), []push.Operation{anOperation("op-1")}); err != nil {
 		t.Fatal(err)
 	}
 
 	// A different caller presenting the same operation id. If the lookup were
 	// not scoped by caller, this would be told the operation had been applied and
 	// would silently drop its own change.
-	got, err := svc.Push(ctx, "user-2", []push.Operation{anOperation("op-1")})
+	got, err := svc.Push(ctx, push.Caller{ID: "user-2", WriteContext: "reserve-north"}, []push.Operation{anOperation("op-1")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +234,7 @@ func TestARefusedOperationDoesNotDiscardTheRestOfTheBatch(t *testing.T) {
 		Outcome: push.OutcomeRefused, ErrorCode: "revision_conflict",
 	}
 
-	got, err := aService(tx).Push(context.Background(), "user-1", []push.Operation{
+	got, err := aService(tx).Push(context.Background(), aCaller(), []push.Operation{
 		anOperation("op-1"), anOperation("op-2"), anOperation("op-3"),
 	})
 	if err != nil {
@@ -259,7 +262,7 @@ func TestAFailedCommitReportsTheWholeBatchFailed(t *testing.T) {
 	tx := newTx()
 	tx.commitErr = errors.New("connection lost")
 
-	got, err := aService(tx).Push(context.Background(), "user-1",
+	got, err := aService(tx).Push(context.Background(), aCaller(),
 		[]push.Operation{anOperation("op-1")})
 	if err == nil {
 		t.Fatal("a failed commit returned no error")
@@ -280,7 +283,7 @@ func TestAnUnreadableOutcomeTableDefersRatherThanRefuses(t *testing.T) {
 	tx := newTx()
 	tx.readErr = errors.New("permission denied for table operation_outcome")
 
-	got, err := aService(tx).Push(context.Background(), "user-1",
+	got, err := aService(tx).Push(context.Background(), aCaller(),
 		[]push.Operation{anOperation("op-1")})
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +304,7 @@ func TestAnOperationWithNoIDIsRefusedRatherThanAppliedAndForgotten(t *testing.T)
 	op := anOperation("")
 	op.OperationID = ""
 
-	got, err := aService(tx).Push(context.Background(), "user-1", []push.Operation{op})
+	got, err := aService(tx).Push(context.Background(), aCaller(), []push.Operation{op})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +323,8 @@ func TestAnOperationWithNoIDIsRefusedRatherThanAppliedAndForgotten(t *testing.T)
 // recorded at all.
 func TestABatchWithNoCallerIsRefusedBeforeAnythingIsWritten(t *testing.T) {
 	tx := newTx()
-	_, err := aService(tx).Push(context.Background(), "", []push.Operation{anOperation("op-1")})
+	_, err := aService(tx).Push(context.Background(), push.Caller{WriteContext: "reserve-north"},
+		[]push.Operation{anOperation("op-1")})
 	if !errors.Is(err, push.ErrNoCaller) {
 		t.Errorf("got %v, want ErrNoCaller", err)
 	}
@@ -329,11 +333,26 @@ func TestABatchWithNoCallerIsRefusedBeforeAnythingIsWritten(t *testing.T) {
 	}
 }
 
+// A token naming no active context cannot be granted a record. Defaulting would
+// mean inventing a context, and a record written into an invented context is
+// invisible to every guide who holds the grant that actually matters.
+func TestACallerWithNoActiveContextIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	tx := newTx()
+	_, err := aService(tx).Push(context.Background(), push.Caller{ID: "user-1"},
+		[]push.Operation{anOperation("op-1")})
+	if !errors.Is(err, push.ErrNoWriteContext) {
+		t.Errorf("got %v, want ErrNoWriteContext", err)
+	}
+	if tx.commits != 0 || tx.applied != nil {
+		t.Error("a caller with no active context reached the database")
+	}
+}
+
 // An empty batch means the client has mis-built its queue, and an empty success
 // would hide that until the data had aged out.
 func TestAnEmptyBatchIsRefusedRatherThanAnsweredWithAnEmptySuccess(t *testing.T) {
 	tx := newTx()
-	_, err := aService(tx).Push(context.Background(), "user-1", nil)
+	_, err := aService(tx).Push(context.Background(), aCaller(), nil)
 	if !errors.Is(err, push.ErrNoOperations) {
 		t.Errorf("got %v, want ErrNoOperations", err)
 	}
@@ -345,7 +364,7 @@ func TestAnEmptyBatchIsRefusedRatherThanAnsweredWithAnEmptySuccess(t *testing.T)
 // The transaction is opened once for the batch, not per operation.
 func TestTheBatchRunsInOneTransaction(t *testing.T) {
 	tx := newTx()
-	if _, err := aService(tx).Push(context.Background(), "user-1", []push.Operation{
+	if _, err := aService(tx).Push(context.Background(), aCaller(), []push.Operation{
 		anOperation("op-1"), anOperation("op-2"),
 	}); err != nil {
 		t.Fatal(err)
