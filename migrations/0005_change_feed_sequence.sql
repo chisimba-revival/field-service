@@ -1,0 +1,16 @@
+-- Inserting into change_feed needs USAGE on its sequence, and 0003 did not
+-- grant it.
+--
+-- 0003 granted select, insert on change_feed and revoked update and delete. That
+-- is the right shape for the table and it is not enough: seq is bigserial, so
+-- an insert draws the next value from change_feed_seq_seq, and a role without
+-- USAGE on that sequence is refused before the row is ever written.
+--
+-- Found by running a push rather than by reading the migration, which is the
+-- third time that has been the only way to find a missing privilege — the first
+-- was 0003 granting no privileges at all on the tables it created.
+--
+-- The grant is on the sequence only. fieldapp still cannot update or delete a
+-- feed row, which is the property 0003 was reaching for: a feed written by the
+-- service and read by clients should not be editable by either.
+grant usage on sequence change_feed_seq_seq to fieldapp;

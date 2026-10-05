@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -217,10 +218,14 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 	}
 
 	var serverRevision int64
+	var serverSpecies, serverCount *string
+	var serverNotes *string
 	var serverState []byte
 	err := t.tx.QueryRow(ctx,
-		`select revision, to_jsonb(s) - 'location' from sighting where id = $1`,
-		op.EntityID).Scan(&serverRevision, &serverState)
+		`select s.revision, s.species_code, s.count::text, s.notes,
+		        to_jsonb(s) - 'location'
+		   from sighting s where s.id = $1`, op.EntityID).
+		Scan(&serverRevision, &serverSpecies, &serverCount, &serverNotes, &serverState)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The contract says an absent entity is treated as a create, but a
 		// correction has no way to become one: it names the fields that are
@@ -233,6 +238,41 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 	}
 	if err != nil {
 		return Result{}, err
+	}
+
+	// Rule 15 is checked HERE, before the update, and not by catching the
+	// constraint violation. Postgres aborts the entire transaction the moment a
+	// statement fails, so a version of this that attempted the update and turned
+	// the error into a refusal would find the batch already dead — every
+	// operation after it would fail with "current transaction is aborted", and
+	// the refusal would be reported alongside a transaction that could not
+	// commit. The check constraint stays as the backstop that no other code path
+	// can skip; this is what makes the violation a normal outcome instead of a
+	// dead batch.
+	newSpecies := payloadTextPtr(op.Payload, "species_code")
+	newCount := payloadIntPtr(op.Payload, "count")
+	reason := payloadTextPtr(op.Payload, "correction_reason")
+	// Counts are compared as ints. They arrive from the database as text because
+	// a nullable integer scanned through a driver that has to handle the null
+	// case is easier to read that way, and a lexical comparison would decide "10"
+	// is less than "9" — the kind of comparison that calls a changed record
+	// unchanged and lets a correction through with no reason.
+	existingCount, countErr := strconv.Atoi(derefOr(serverCount, ""))
+	if countErr != nil {
+		existingCount = -1
+	}
+	changesClaim := (newSpecies != nil && (serverSpecies == nil || *newSpecies != *serverSpecies)) ||
+		(newCount != nil && *newCount != existingCount)
+	if changesClaim && (reason == nil || *reason == "") {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "correction_requires_a_reason",
+			ServerState: map[string]any{
+				"species_code": derefOr(serverSpecies, ""),
+				"count":        derefOr(serverCount, ""),
+			},
+			ClientState: op.Payload,
+		}, nil
 	}
 
 	if serverRevision != *op.BaseRevision {
@@ -266,24 +306,16 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 
 	var revision int64
 	err = t.tx.QueryRow(ctx, q, op.EntityID,
-		payloadTextPtr(op.Payload, "correction_reason"),
-		payloadTextPtr(op.Payload, "species_code"),
-		payloadIntPtr(op.Payload, "count"),
+		reason, newSpecies, newCount,
 		payloadTextPtr(op.Payload, "verification_notes"),
 		caller.ID,
 	).Scan(&revision)
 	if err != nil {
-		if isCorrectionReasonRequired(err) {
-			// The rule the whole service is built around, arriving as a database
-			// error. Named rather than surfaced as a failure, so the client can
-			// tell "you corrected a count without saying why" from "something
-			// broke".
-			return Result{
-				OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
-				Outcome: OutcomeRefused, ErrorCode: "correction_requires_a_reason",
-				ClientState: op.Payload,
-			}, nil
-		}
+		// A constraint violation reaching here means the check above and the
+		// constraint disagree, which is a bug in this file rather than a client's
+		// mistake. It is reported as an error so it fails the batch loudly: it
+		// must not be turned into a deferral, because a deferral tells the client
+		// to try again when the truth is that this service is broken.
 		return Result{}, err
 	}
 
@@ -335,12 +367,11 @@ func isUniqueViolation(err error) bool {
 // Matching on the constraint name rather than on "some error happened" is what
 // lets the client be told what is actually wrong with its correction instead of
 // being handed a generic failure it cannot act on.
-func isCorrectionReasonRequired(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
+func derefOr(s *string, fallback string) string {
+	if s == nil {
+		return fallback
 	}
-	return pgErr.Code == "23514" && pgErr.ConstraintName == "correction_has_reason"
+	return *s
 }
 
 // Payload readers. Each returns nil for an absent key so that "not mentioned"
@@ -369,9 +400,17 @@ func payloadIntPtr(m map[string]any, k string) *int {
 	}
 	return nil
 }
+
+// payloadInt handles both numeric kinds a payload can carry.
+//
+// It used to accept only float64, while its nullable twin accepted float64 and
+// int. A payload built with a native Go int therefore got a silent NULL: the
+// sighting was recorded with no count, and nothing reported an error — the worst
+// shape a bug can have here, because rule 21 is precisely that an absent count
+// and a count of zero mean different things and neither may be invented.
 func payloadInt(m map[string]any, k string) any {
-	if v, ok := m[k].(float64); ok {
-		return int(v)
+	if v := payloadIntPtr(m, k); v != nil {
+		return *v
 	}
 	return nil
 }

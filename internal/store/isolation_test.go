@@ -444,6 +444,18 @@ func TestMain(m *testing.M) {
 	if dsn := strings.TrimSpace(os.Getenv("FIELDSVC_TEST_ADMIN_DSN")); dsn != "" {
 		adminDSN = dsn
 	}
+	// Serialise against the other integration package. See dblock_test.go for
+	// why this is a lock and not a reminder to pass -p 1.
+	if conn, err := pgx.Connect(context.Background(), adminDSN); err == nil {
+		release := holdAdvisoryLock(conn)
+		defer release()
+		defer func() { _ = conn.Close(context.Background()) }()
+		code := m.Run()
+		release()
+		os.Exit(code)
+	}
+	// No database: let the tests skip themselves rather than fail here, so a
+	// checkout without Postgres still builds and vets.
 	os.Exit(m.Run())
 }
 

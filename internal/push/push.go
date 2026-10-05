@@ -245,7 +245,17 @@ func (s *Service) Push(ctx context.Context, caller Caller, ops []Operation) ([]R
 
 	results := make([]Result, 0, len(ops))
 	for _, op := range ops {
-		results = append(results, s.one(ctx, tx, caller, op))
+		res, err := s.one(ctx, tx, caller, op)
+		if err != nil {
+			// An unexpected failure fails the whole batch, and that is not a
+			// policy choice so much as Postgres refusing to let us: one failed
+			// statement aborts the transaction, so there is nothing left to
+			// commit. Reporting it as a per-operation deferral would be worse
+			// than wrong — it would tell the client the service is busy when
+			// the service is broken, and it would do so silently.
+			return nil, err
+		}
+		results = append(results, res)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -258,13 +268,13 @@ func (s *Service) Push(ctx context.Context, caller Caller, ops []Operation) ([]R
 }
 
 // one applies a single operation, honouring a recorded outcome if there is one.
-func (s *Service) one(ctx context.Context, tx Tx, caller Caller, op Operation) Result {
+func (s *Service) one(ctx context.Context, tx Tx, caller Caller, op Operation) (Result, error) {
 	if op.OperationID == "" {
 		return Result{
 			Entity: op.Entity, EntityID: op.EntityID,
 			Outcome: OutcomeRefused, ErrorCode: "missing_operation_id",
 			ClientState: op.Payload,
-		}
+		}, nil
 	}
 
 	recorded, found, err := tx.RecordedOutcome(ctx, caller.ID, op.OperationID)
@@ -273,19 +283,15 @@ func (s *Service) one(ctx context.Context, tx Tx, caller Caller, op Operation) R
 		// the right direction: this operation may already have been applied, and
 		// refusing it would tell the client its change was rejected when it might
 		// already be committed. Deferred means "ask again", which is true.
-		return deferral(op, "outcome_unreadable")
+		return deferral(op, "outcome_unreadable"), nil
 	}
 	if found {
 		// The originally recorded outcome, including a rejection. Re-evaluating
 		// would let a retry succeed by being different, which is not a retry.
-		return recorded
+		return recorded, nil
 	}
 
-	res, err := tx.Apply(ctx, caller, op)
-	if err != nil {
-		return deferral(op, "apply_failed")
-	}
-	return res
+	return tx.Apply(ctx, caller, op)
 }
 
 func deferral(op Operation, code string) Result {
