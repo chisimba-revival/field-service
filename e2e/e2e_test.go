@@ -55,6 +55,7 @@ import (
 	"field-service/internal/jwks"
 	"field-service/internal/pull"
 	"field-service/internal/push"
+	"field-service/internal/species"
 	"field-service/internal/wiring"
 )
 
@@ -185,8 +186,18 @@ func start(t *testing.T) *rig {
 		Log: testLogger{t},
 	}
 
+	catalogue := &httpapi.Catalogue{
+		Catalogue: species.New(species.NewPgxStore(pool)),
+		Log:       testLogger{t},
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/sync/", httpapi.NewSyncRoutes(guard, sync))
+	// Registered exactly as cmd/field-service does. The rig previously wired
+	// only the sync routes, so it was not the assembly it claimed to be: a route
+	// added to main and forgotten here would have been tested by neither.
+	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
+	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 	})
