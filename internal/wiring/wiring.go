@@ -73,6 +73,9 @@ func (c claims) Epoch() int64          { return c.p.Epoch }
 // here, so there is one answer to "does this token carry this scope".
 func (c claims) HasScope(scope string) bool { return c.p.HasScope(scope) }
 
+// HasRole reports whether the token carried a named group.
+func (c claims) HasRole(role string) bool { return c.p.HasRole(role) }
+
 // IssuedAt reports the token's issue time and whether it carried one.
 //
 // The second return is not decoration. The revocation rule needs an issue time to

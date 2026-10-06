@@ -2,15 +2,20 @@ package httpapi
 
 // The sign-off endpoints.
 //
-// One route for now: creating a draft. Submission and review are separate acts
+// Creating a draft, and reading one back. Submission and review are separate acts
 // with separate permissions, and a route that did all three at once would let a
 // trainee file and approve a sign-off in one call — which is the thing the
 // contract's split exists to prevent.
+//
+// The read is not optional to the rest of it. A sign-off a mentor writes in
+// Chisimba is feedback for a trainee, and feedback the trainee cannot fetch is
+// not feedback: it is a row the mentor filled in.
 
 import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"field-service/internal/signoff"
 )
@@ -32,7 +37,46 @@ type Signoffs struct {
 func NewSignoffRoutes(g *Guard, s *Signoffs) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/signoffs", g.Serve(s.createHandler()))
+	// The read a trainee needs to actually receive the feedback. Without it the
+	// change feed tells a device a sign-off changed and leaves it with nothing to
+	// fetch, so the trainee would be told they had been assessed and not what of.
+	mux.Handle("/api/v1/signoffs/", g.Serve(s.getHandler()))
 	return mux
+}
+
+// getHandler serves one sign-off to a caller entitled to see it.
+func (s *Signoffs) getHandler() Handler {
+	return func(w http.ResponseWriter, r *http.Request, c Caller) error {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v1/signoffs/")
+		if id == "" || strings.Contains(id, "/") {
+			return problem(w, http.StatusNotFound, "unknown_signoff",
+				"No sign-off was named.")
+		}
+
+		// Whether this caller is an administrator is decided here, where the token
+		// is, and reaches the store as a plain boolean. The store cannot read the
+		// token and must not be asked to decide it from a string that means
+		// something else.
+		isAdmin := s.Signoffs.AdminRole != "" && c.HasRole(s.Signoffs.AdminRole)
+
+		rec, err := s.Signoffs.Get(r.Context(), c.Subject(), c.ActiveContext(), isAdmin, id)
+		switch {
+		case err == nil:
+			return writeJSON(w, http.StatusOK, rec)
+		case signoff.NotFound(err):
+			// The same answer for an unknown id and for somebody else's. Any
+			// difference turns this into a way of learning which sign-offs exist,
+			// and the id is in the change feed every device in the context holds.
+			return problem(w, http.StatusNotFound, "unknown_signoff",
+				"There is no sign-off with that identifier.")
+		default:
+			var ref *signoff.Refusal
+			if errors.As(err, &ref) {
+				return problem(w, statusForRefusal(ref.Code), ref.Code, ref.Message)
+			}
+			return s.internal(w, r, err)
+		}
+	}
 }
 
 func (s *Signoffs) createHandler() Handler {

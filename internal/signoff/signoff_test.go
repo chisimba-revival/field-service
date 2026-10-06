@@ -13,6 +13,28 @@ type fakeStore struct {
 	err      error
 	gotCtx   string
 	gotAsses []Assessment
+
+	// What the read was asked, so the read rule can be asserted where it is
+	// decided rather than only at the store's answer.
+	gotCaller string
+	gotAdmin  bool
+	gotID     string
+}
+
+// Get records what it was asked, so a test can assert the read rule reaches the
+// store as a boolean rather than as a role name the store would have to interpret.
+func (f *fakeStore) Get(_ context.Context, context, callerID string, isAdmin bool, id string) (Record, bool, error) {
+	f.gotCtx = context
+	f.gotCaller = callerID
+	f.gotAdmin = isAdmin
+	f.gotID = id
+	if f.err != nil {
+		return Record{}, false, f.err
+	}
+	if f.record.ID == "" || f.record.ID != id {
+		return Record{}, false, nil
+	}
+	return f.record, true, nil
 }
 
 func (f *fakeStore) Create(_ context.Context, callerID string, v Validated) (Record, error) {

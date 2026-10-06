@@ -9,6 +9,7 @@ package signoff
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -90,6 +91,7 @@ func refuse(code, message string) error { return &Refusal{Code: code, Message: m
 // Reviewer store interface.
 type Store interface {
 	Create(ctx context.Context, callerID string, v Validated) (Record, error)
+	Get(ctx context.Context, context, callerID string, isAdmin bool, id string) (Record, bool, error)
 }
 
 // Service applies the rules.
@@ -101,7 +103,57 @@ type Service struct {
 	Catalogue Catalogue
 	// Whether an outing exists in a context.
 	Outing func(ctx context.Context, outingID, context string) (bool, error)
+
+	// AdminRole is the group a programme administrator belongs to.
+	//
+	// Empty means nobody is one, which is the safe direction: a rule that widens
+	// who may read somebody else's assessment is exactly the kind that must not
+	// come into being by defaulting to something. It is a group rather than a
+	// configured list of ids because group membership is already the authority for
+	// what a person may reach, and a second list here could disagree with it.
+	AdminRole string
 }
+
+// Get returns one sign-off to a caller entitled to see it.
+//
+// Three readers, and nobody else: the trainee it assesses, the mentor who wrote
+// it, and a programme administrator in the same context. Anything else is
+// reported as not found rather than as forbidden, so the answer to "is there a
+// sign-off with this id" is the same whether the id is unknown or simply not this
+// caller's — otherwise the endpoint becomes a way of learning which sign-offs
+// exist.
+//
+// The rule lives in the store's statement rather than here. A caller of the store
+// that forgot to apply it would return another trainee's honest assessment of
+// themselves, and nothing else in this service would notice; a caller that
+// forgot here would be caught by the store refusing.
+func (s *Service) Get(ctx context.Context, callerID, activeContext string, isAdmin bool, id string) (Record, error) {
+	if callerID == "" || activeContext == "" {
+		// No write context is a refusal on create, but here it means the caller
+		// cannot even be placed, and a read rule that matched everyone would be
+		// the wrong answer to "who".
+		return Record{}, refuse("no_read_context",
+			"There is no context to read from, so nothing can be said to be yours.")
+	}
+	if !isUUID(id) {
+		return Record{}, refuse("signoff_id_malformed",
+			"That is not the identifier of a sign-off.")
+	}
+	rec, found, err := s.store.Get(ctx, activeContext, callerID, isAdmin, id)
+	if err != nil {
+		return Record{}, err
+	}
+	if !found {
+		return Record{}, ErrNotFound
+	}
+	return rec, nil
+}
+
+// ErrNotFound means there is no sign-off this caller may see with that id.
+var ErrNotFound = errors.New("signoff: not found")
+
+// NotFound reports whether err is ErrNotFound.
+func NotFound(err error) bool { return errors.Is(err, ErrNotFound) }
 
 // Catalogue answers whether a competency can be assessed.
 type Catalogue interface {

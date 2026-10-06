@@ -28,6 +28,9 @@ type fakePrincipal struct {
 	epoch  int64
 	issued time.Time
 	noIat  bool
+	// roles lets a test hold a token carrying a group — an administrator's,
+	// say — without needing a real RSA key or a real Chisimba group behind it.
+	roles []string
 }
 
 func (f fakePrincipal) TokenType() string     { return f.typ }
@@ -36,6 +39,14 @@ func (f fakePrincipal) Scopes() []string      { return f.scopes }
 func (f fakePrincipal) ActiveContext() string { return f.active }
 func (f fakePrincipal) Grants() []string      { return f.grants }
 func (f fakePrincipal) Epoch() int64          { return f.epoch }
+func (f fakePrincipal) HasRole(r string) bool {
+	for _, held := range f.roles {
+		if held == r {
+			return true
+		}
+	}
+	return false
+}
 func (f fakePrincipal) HasScope(s string) bool {
 	for _, held := range f.scopes {
 		if held == s {

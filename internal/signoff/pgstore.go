@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -50,6 +51,72 @@ func NewPgxStore(pool *pgxpool.Pool) *PgxStore { return &PgxStore{pool: pool} }
 // and a client told the sign-off was recorded while its assessments were missing
 // would be worse than a refusal: the record would read as a mentor's judgement on
 // a subset of what they actually said.
+// Get reads one sign-off the caller is entitled to see, with its assessments.
+//
+// The authorisation is two OR'd clauses inside the WHERE, and a caller outside
+// them gets no row rather than an error. That is deliberate: answering "forbidden"
+// for a sign-off that exists and "not found" for one that does not would let
+// anyone learn which ids are real, and a sign-off id appears in a feed row handed
+// to every device in the context — so it is not a secret to be protected.
+//
+// isAdmin arrives as a boolean rather than a role name because "this caller holds
+// the administrator group" is a fact about the token, not about any column of
+// this row. Passing the role name in here would have meant the statement
+// comparing a column against a string that means something else entirely.
+//
+// The trainee's own copy is a cache of a decision, not an editable row, so nothing
+// here writes and the read is the whole relationship.
+func (s *PgxStore) Get(ctx context.Context, context, callerID string, isAdmin bool, id string) (Record, bool, error) {
+	const q = `
+		select s.id::text, s.context_code, s.trainee_id, s.mentor_id, s.outing_id::text,
+		       coalesce(s.overall_comment, ''), s.status, s.revision
+		from signoff s
+		where s.id = $1
+		  and s.context_code = $2
+		  and (s.trainee_id = $3 or s.mentor_id = $3 or $4)`
+
+	row := s.pool.QueryRow(ctx, q, id, context, callerID, isAdmin)
+	var rec Record
+	err := row.Scan(&rec.ID, &rec.Context, &rec.TraineeID, &rec.MentorID,
+		&rec.OutingID, &rec.OverallComment, &rec.Status, &rec.Revision)
+	switch {
+	case err == nil:
+	case errors.Is(err, pgx.ErrNoRows):
+		return Record{}, false, nil
+	default:
+		return Record{}, false, err
+	}
+
+	// The assessments are read separately rather than joined in. A join would
+	// repeat the sign-off columns per assessment and would need the count split
+	// back out again, and the child rows are the evidence a trainee is here to
+	// read — they are the answer, not an accessory to it.
+	const aq = `
+		select competency_code, rating, evidence
+		from signoff_competency
+		where signoff_id = $1
+		order by position`
+
+	rows, err := s.pool.Query(ctx, aq, rec.ID)
+	if err != nil {
+		return Record{}, false, err
+	}
+	defer rows.Close()
+
+	rec.Assessments = []Assessment{}
+	for rows.Next() {
+		var a Assessment
+		if err := rows.Scan(&a.Code, &a.Rating, &a.Evidence); err != nil {
+			return Record{}, false, err
+		}
+		rec.Assessments = append(rec.Assessments, a)
+	}
+	if err := rows.Err(); err != nil {
+		return Record{}, false, err
+	}
+	return rec, true, nil
+}
+
 func (s *PgxStore) Create(ctx context.Context, callerID string, v Validated) (Record, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

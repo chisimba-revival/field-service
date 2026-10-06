@@ -38,6 +38,16 @@ type Principal interface {
 	Subject() string
 	TokenType() string
 	Scopes() []string
+	// HasRole reports whether the token carried a named group, which is how
+	// Chisimba expresses what a person is.
+	//
+	// It is on the interface because a read rule needs to ask, and it reads the
+	// token rather than a list configured here on purpose: a group membership is
+	// already the authority for what a person may reach, so answering "is this
+	// person an administrator" from this service's own configuration would be a
+	// second source free to disagree with the first — and a person who is an
+	// administrator in Chisimba and absent from that list would be two people.
+	HasRole(string) bool
 	ActiveContext() string
 	Grants() []string
 	Epoch() int64
