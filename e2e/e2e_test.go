@@ -51,10 +51,12 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"field-service/internal/authn"
+	"field-service/internal/competency"
 	"field-service/internal/httpapi"
 	"field-service/internal/jwks"
 	"field-service/internal/pull"
 	"field-service/internal/push"
+	"field-service/internal/signoff"
 	"field-service/internal/species"
 	"field-service/internal/verify"
 	"field-service/internal/wiring"
@@ -209,6 +211,28 @@ func start(t *testing.T) *rig {
 	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/log-book/verify", httpapi.NewVerificationRoutes(guard, verifier))
+
+	// The sign-off and competency routes, registered exactly as
+	// cmd/field-service does. Two routes were added to main and forgotten here
+	// once already, and the tests that needed them failed with 404 — which reads
+	// exactly like a broken endpoint rather than a rig that is not the assembly it
+	// claims to be. The guard is the same object in both files, so a route tested
+	// here is tested behind the door it really runs behind.
+	signoffs := &httpapi.Signoffs{
+		Signoffs: signoff.New(
+			signoff.NewPgxStore(pool),
+			signoff.NewPgCatalogue(pool),
+			signoff.NewPgOutings(pool).InContext,
+		),
+		Log: testLogger{t},
+	}
+	comps := &httpapi.Competencies{
+		Competencies: competency.New(competency.NewPgxStore(pool)),
+		Log:          testLogger{t},
+	}
+	mux.Handle("/api/v1/signoffs", httpapi.NewSignoffRoutes(guard, signoffs))
+	mux.Handle("/api/v1/competencies", httpapi.NewCompetencyRoutes(guard, comps))
+	mux.Handle("/api/v1/competencies/", httpapi.NewCompetencyRoutes(guard, comps))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 	})

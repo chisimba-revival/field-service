@@ -184,11 +184,19 @@ func NewPgOutings(pool *pgxpool.Pool) *PgOutings { return &PgOutings{pool: pool}
 // that does not exist — the same property the drive check has, and for the same
 // reason: a message that distinguished them would be an oracle for walking the
 // id space to discover other reserves' outings.
+// The cancelled filter is absent deliberately: an outing has no deleted_at, and
+// cancelling is a status and a reason rather than a deletion. The filter was
+// written from the habit of every other table here carrying one, and it made
+// every sign-off naming an outing fail with "column deleted_at does not exist",
+// which is the whole request returning 500 rather than one row being found.
+//
+// The unit tests could not see it because they fake InContext, so this query was
+// only ever executed by the end-to-end suite.
 func (o *PgOutings) InContext(ctx context.Context, outingID, context string) (bool, error) {
 	const q = `
 		select exists (
 			select 1 from outing
-			where id = $1 and context_code = $2 and deleted_at is null
+			where id = $1 and context_code = $2
 		)`
 	var ok bool
 	err := o.pool.QueryRow(ctx, q, outingID, context).Scan(&ok)
