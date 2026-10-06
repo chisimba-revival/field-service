@@ -56,6 +56,7 @@ import (
 	"field-service/internal/pull"
 	"field-service/internal/push"
 	"field-service/internal/species"
+	"field-service/internal/verify"
 	"field-service/internal/wiring"
 )
 
@@ -72,6 +73,11 @@ const (
 	// landing in the right place is evidence of something rather than a
 	// coincidence of naming.
 	foreignContext = "someone-elses-reserve"
+
+	// The scope the service door is built with. The same string the guard's own
+	// tests use, so a change to one and not the other shows up as a failure here
+	// rather than as a route quietly reachable without the right scope.
+	verificationScope = "field:verify"
 )
 
 func adminDSN() string {
@@ -190,6 +196,10 @@ func start(t *testing.T) *rig {
 		Catalogue: species.New(species.NewPgxStore(pool)),
 		Log:       testLogger{t},
 	}
+	verifier := &httpapi.Verification{
+		Verify: verify.New(verify.NewPgxStore(pool)),
+		Log:    testLogger{t},
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/sync/", httpapi.NewSyncRoutes(guard, sync))
@@ -198,6 +208,7 @@ func start(t *testing.T) *rig {
 	// added to main and forgotten here would have been tested by neither.
 	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
+	mux.Handle("/api/v1/log-book/verify", httpapi.NewVerificationRoutes(guard, verifier))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 	})
@@ -268,6 +279,56 @@ func (r *rig) token(epoch int64, ctx string, scopes ...string) string {
 		r.t.Fatalf("sign: %v", err)
 	}
 	return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// serviceToken mints a token of type `service`, which is what Chisimba's mentor
+// module presents.
+//
+// It is a separate function rather than a parameter on token() because the two
+// doors must be tested as two different things. A service token carries no
+// context and no grants, so a helper that could add them would make it possible
+// to write a passing test that had proved nothing about the service door.
+func (r *rig) serviceToken(scopes ...string) string {
+	r.t.Helper()
+	if len(scopes) == 0 {
+		scopes = []string{verificationScope}
+	}
+	now := time.Now()
+	header := map[string]any{"alg": "RS256", "typ": "JWT", "kid": r.kid}
+	claims := map[string]any{
+		// Names the service, not a person. The mentor arrives in the body and is
+		// checked against Chisimba's own records; a service token that named one
+		// would be a user token wearing a hat.
+		"sub": "chisimba-mentor-module", "type": "service", "scope": scopes,
+		"epoch": 0, "ver": "harness-service-token",
+		"iss": issuer, "aud": audience,
+		"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+	}
+	signing := encodeSegment(header) + "." + encodeSegment(claims)
+	sum := sha256.Sum256([]byte(signing))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, r.keys, 5, sum[:])
+	if err != nil {
+		r.t.Fatalf("sign: %v", err)
+	}
+	return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// verifyOnce posts a verification through the service route.
+func (r *rig) verifyOnce(tok string, body any) (int, []byte) {
+	r.t.Helper()
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		r.t.Fatalf("marshal: %v", err)
+	}
+	req, err := http.NewRequest("POST", r.server.URL+"/api/v1/log-book/verify", strings.NewReader(string(encoded)))
+	if err != nil {
+		r.t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	return r.do(req)
 }
 
 func encodeSegment(v any) string {

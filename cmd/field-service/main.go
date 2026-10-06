@@ -34,6 +34,7 @@ import (
 	"field-service/internal/pull"
 	"field-service/internal/push"
 	"field-service/internal/species"
+	"field-service/internal/verify"
 	"field-service/internal/wiring"
 )
 
@@ -117,6 +118,16 @@ func run() error {
 	mux.Handle("/api/v1/sync/", httpapi.NewSyncRoutes(guard, sync))
 	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
+
+	// The verification door, reached only with a service token. It takes the pool
+	// and not the session's read handle: a service token carries no context, so
+	// there are no grants to set and every context rule it applies is written in
+	// the request rather than inherited from the token.
+	verifier := &httpapi.Verification{
+		Verify: verify.New(verify.NewPgxStore(pool)),
+		Log:    logAdapter{log},
+	}
+	mux.Handle("/api/v1/log-book/verify", httpapi.NewVerificationRoutes(guard, verifier))
 	// Health is the one route outside the guard, deliberately: a liveness probe
 	// cannot present a token, and a probe that needs credentials is a probe that
 	// fails when the thing it is probing is broken.
