@@ -29,6 +29,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"field-service/internal/authn"
+	"field-service/internal/competency"
 	"field-service/internal/httpapi"
 	"field-service/internal/jwks"
 	"field-service/internal/pull"
@@ -118,6 +119,14 @@ func run() error {
 	mux.Handle("/api/v1/sync/", httpapi.NewSyncRoutes(guard, sync))
 	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
+
+	// The competency catalogue, for the same reason and over the same pool.
+	comps := &httpapi.Competencies{
+		Competencies: competency.New(competency.NewPgxStore(pool)),
+		Log:          logAdapter{log},
+	}
+	mux.Handle("/api/v1/competencies", httpapi.NewCompetencyRoutes(guard, comps))
+	mux.Handle("/api/v1/competencies/", httpapi.NewCompetencyRoutes(guard, comps))
 
 	// The verification door, reached only with a service token. It takes the pool
 	// and not the session's read handle: a service token carries no context, so
