@@ -343,8 +343,15 @@ func TestTheDoorsAreDisjoint(t *testing.T) {
 		"base_revision": 1,
 	}
 
-	// A person's token, even one carrying the verification scope, is refused.
-	person := r.token(0, "Alpha", verificationScope)
+	// A person's token, carrying EVERY scope both doors require, is refused.
+	//
+	// Both scopes matter, and carrying only one made this assertion vacuous: the
+	// person door requires the ordinary scope, so a token holding just the
+	// verification scope was refused for missing scope — a different check doing
+	// the work — and the test passed against a route that had been opened to
+	// people. The only thing left that can refuse this request is that its
+	// subject is a person.
+	person := r.token(0, "Alpha", scope, verificationScope)
 	if code, _ := r.verifyOnce(person, body); code != http.StatusUnauthorized {
 		t.Errorf("a person token reached the verification route: status %d", code)
 	}
