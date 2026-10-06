@@ -34,6 +34,7 @@ import (
 	"field-service/internal/jwks"
 	"field-service/internal/pull"
 	"field-service/internal/push"
+	"field-service/internal/signoff"
 	"field-service/internal/species"
 	"field-service/internal/verify"
 	"field-service/internal/wiring"
@@ -117,6 +118,21 @@ func run() error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/sync/", httpapi.NewSyncRoutes(guard, sync))
+	// Sign-offs are written through the ordinary person door, which does set
+	// grants, so the write context is the caller's active context, read from the
+	// authenticated Caller by the handler — the same rule that governs a sighting.
+	// The service door is reserved for verification and is refused here by
+	// construction, not by a rule someone has to remember.
+	signoffs := &httpapi.Signoffs{
+		Signoffs: signoff.New(
+			signoff.NewPgxStore(pool),
+			signoff.NewPgCatalogue(pool),
+			signoff.NewPgOutings(pool).InContext,
+		),
+		Log: logAdapter{log},
+	}
+
+	mux.Handle("/api/v1/signoffs", httpapi.NewSignoffRoutes(guard, signoffs))
 	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
 
