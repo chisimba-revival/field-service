@@ -231,6 +231,11 @@ func start(t *testing.T) *rig {
 		Log:          testLogger{t},
 	}
 	mux.Handle("/api/v1/signoffs", httpapi.NewSignoffRoutes(guard, signoffs))
+	// The read, registered exactly as cmd/field-service registers it. This rig has
+	// now dropped a route three times by adding one to main and forgetting it here,
+	// and each time the omission read as a broken endpoint rather than as a rig
+	// that is not the assembly it claims to be.
+	mux.Handle("/api/v1/signoffs/", httpapi.NewSignoffRoutes(guard, signoffs))
 	mux.Handle("/api/v1/competencies", httpapi.NewCompetencyRoutes(guard, comps))
 	mux.Handle("/api/v1/competencies/", httpapi.NewCompetencyRoutes(guard, comps))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
