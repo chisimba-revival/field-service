@@ -37,11 +37,37 @@ func (f *fakeStore) Get(_ context.Context, context, callerID string, isAdmin boo
 	return f.record, true, nil
 }
 
-func (f *fakeStore) Create(_ context.Context, callerID string, v Validated) (Record, error) {
+func (f *fakeStore) Create(_ context.Context, callerID string, grants []string, v Validated) (Record, error) {
 	f.called++
 	f.gotCtx = v.Context
 	f.gotAsses = v.Assessments
 	return f.record, f.err
+}
+
+func (f *fakeStore) Submit(_ context.Context, callerID string, id string, activeContext string) (Record, error) {
+	f.called++
+	f.gotCaller = callerID
+	f.gotID = id
+	if f.err != nil {
+		return Record{}, f.err
+	}
+	if f.record.ID == "" || f.record.ID != id {
+		return Record{}, ErrNotFound
+	}
+	return f.record, nil
+}
+
+func (f *fakeStore) Review(_ context.Context, callerID string, id string, req ReviewRequest, activeContext string) (Record, error) {
+	f.called++
+	f.gotCaller = callerID
+	f.gotID = id
+	if f.err != nil {
+		return Record{}, f.err
+	}
+	if f.record.ID == "" || f.record.ID != id {
+		return Record{}, ErrNotFound
+	}
+	return f.record, nil
 }
 
 type fakeCatalogue struct {
@@ -118,7 +144,7 @@ func TestRefusals(t *testing.T) {
 			svc, st, _ := harness(t)
 			req := goodRequest()
 			c.mut(&req)
-			_, err := svc.Create(context.Background(), "42", "Alpha", req)
+			_, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, req)
 			if err == nil {
 				t.Fatalf("expected %s, got a stored record", c.codes)
 			}
@@ -145,7 +171,7 @@ func TestNotObservedStillRequiresEvidence(t *testing.T) {
 	req.Assessments[0].Rating = NotObserved
 	req.Assessments[0].Evidence = ""
 
-	_, err := svc.Create(context.Background(), "42", "Alpha", req)
+	_, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, req)
 	var ref *Refusal
 	if !errors.As(err, &ref) || ref.Code != "signoff_assessment_without_evidence" {
 		t.Fatalf("not_observed with no evidence gave %v, want the evidence refusal", err)
@@ -159,7 +185,7 @@ func TestARetiredCompetencyIsNotAssessable(t *testing.T) {
 	req := goodRequest()
 	req.Assessments[0].Code = "OLDCO"
 
-	_, err := svc.Create(context.Background(), "42", "Alpha", req)
+	_, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, req)
 	var ref *Refusal
 	if !errors.As(err, &ref) || ref.Code != "unknown_competency" {
 		t.Fatalf("got %v, want unknown_competency", err)
@@ -174,7 +200,7 @@ func TestARetiredCompetencyIsNotAssessable(t *testing.T) {
 func TestNoWriteContextIsRefused(t *testing.T) {
 	svc, st, _ := harness(t)
 	for _, ctx := range []string{"", "   "} {
-		_, err := svc.Create(context.Background(), "42", ctx, goodRequest())
+		_, err := svc.Create(context.Background(), "42", ctx, []string{ctx}, goodRequest())
 		var ref *Refusal
 		if !errors.As(err, &ref) || ref.Code != "no_write_context" {
 			t.Fatalf("context %q gave %v, want no_write_context", ctx, err)
@@ -189,7 +215,7 @@ func TestNoWriteContextIsRefused(t *testing.T) {
 // field at all, so there is nothing to ignore.
 func TestTheWriteContextIsTheCallersOwn(t *testing.T) {
 	svc, st, _ := harness(t)
-	if _, err := svc.Create(context.Background(), "42", "Alpha", goodRequest()); err != nil {
+	if _, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, goodRequest()); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if st.gotCtx != "Alpha" {
@@ -204,7 +230,7 @@ func TestCodesAreNormalisedBeforeTheStore(t *testing.T) {
 	req := goodRequest()
 	req.Assessments[0].Code = "  navmap  "
 
-	if _, err := svc.Create(context.Background(), "42", "Alpha", req); err != nil {
+	if _, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, req); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if cat.asked[0] != "NAVMAP" {
@@ -224,7 +250,7 @@ func TestAssessmentOrderIsPreserved(t *testing.T) {
 		{Code: "SAFFIR", Rating: Expert, Evidence: "handled a rifle correctly throughout"},
 		{Code: "NAVMAP", Rating: Developing, Evidence: "needed a bearing twice"},
 	}
-	if _, err := svc.Create(context.Background(), "42", "Alpha", req); err != nil {
+	if _, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, req); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	if st.gotAsses[0].Code != "SAFFIR" || st.gotAsses[1].Code != "NAVMAP" {
@@ -240,7 +266,7 @@ func TestACatalogueFaultIsNotARefusal(t *testing.T) {
 	cat := &fakeCatalogue{err: errors.New("connection refused")}
 	svc := New(st, cat, func(context.Context, string, string) (bool, error) { return true, nil })
 
-	_, err := svc.Create(context.Background(), "42", "Alpha", goodRequest())
+	_, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, goodRequest())
 	if err == nil {
 		t.Fatal("expected the fault to surface")
 	}
@@ -265,7 +291,7 @@ func TestAnOutingInAnotherContextIsIndistinguishableFromAnAbsentOne(t *testing.T
 			seen = append(seen, id)
 			return false, nil
 		})
-	_, err := svc.Create(context.Background(), "42", "Alpha", goodRequest())
+	_, err := svc.Create(context.Background(), "42", "Alpha", []string{"Alpha"}, goodRequest())
 	var ref *Refusal
 	if !errors.As(err, &ref) || ref.Code != "unknown_outing" {
 		t.Fatalf("got %v, want unknown_outing", err)

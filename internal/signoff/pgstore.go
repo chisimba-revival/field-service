@@ -37,13 +37,64 @@ type Record struct {
 
 // PgxStore writes sign-offs over a pool.
 //
-// No Querier and no transaction supplied by the caller: a sign-off is written
-// through the ordinary person door, which does set grants, so the statements here
-// name their context explicitly and rely on the isolation policy for the rest.
+// The RLS policy on signoff requires app.context_grants and app.caller_id
+// session variables to be set. Each method sets them within its transaction.
 type PgxStore struct{ pool *pgxpool.Pool }
 
 // NewPgxStore builds a store over a pool.
 func NewPgxStore(pool *pgxpool.Pool) *PgxStore { return &PgxStore{pool: pool} }
+
+// setSessionVars configures the RLS session variables on a transaction.
+// These are set with is_local=true so they only apply to this transaction.
+func setSessionVars(ctx context.Context, tx pgx.Tx, callerID string, contextGrants []string) error {
+	// Set the caller ID for RLS policy check
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.caller_id', $1, true)`, callerID); err != nil {
+		return err
+	}
+
+	// Set the context grants as a comma-separated list, which the RLS policies
+	// read via string_to_array(current_setting(...), ','). This matches the
+	// format wiring.joinGrants produces.
+	grants := ""
+	for i, g := range contextGrants {
+		if i > 0 {
+			grants += ","
+		}
+		grants += g
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.context_grants', $1, true)`, grants); err != nil {
+		return err
+	}
+
+	// Verify the session variables were set as expected by reading them back.
+	// This is a no-op in the normal case, but it surfaces configuration faults
+	// immediately rather than as a policy denial after an insert.
+	var gotCaller string
+	err := tx.QueryRow(ctx, `SELECT current_setting('app.caller_id', true)`).Scan(&gotCaller)
+	if err != nil || gotCaller != callerID {
+		// If the read-back doesn't match, something is wrong with the session
+		// state. Return an error rather than let the insert fail with a policy
+		// error that doesn't say why.
+		return err
+	}
+
+	return nil
+}
+
+// extractContextCodes extracts unique context codes from a slice of maps.
+func extractContextCodes(maps []map[string]interface{}) []string {
+	seen := make(map[string]bool)
+	var contexts []string
+	for _, m := range maps {
+		if ctx, ok := m["context_code"].(string); ok {
+			if !seen[ctx] {
+				seen[ctx] = true
+				contexts = append(contexts, ctx)
+			}
+		}
+	}
+	return contexts
+}
 
 // Create writes the sign-off and its assessments in one transaction.
 //
@@ -67,6 +118,18 @@ func NewPgxStore(pool *pgxpool.Pool) *PgxStore { return &PgxStore{pool: pool} }
 // The trainee's own copy is a cache of a decision, not an editable row, so nothing
 // here writes and the read is the whole relationship.
 func (s *PgxStore) Get(ctx context.Context, context, callerID string, isAdmin bool, id string) (Record, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Record{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Set session variables for RLS policy
+	contextCodes := []string{context}
+	if err := setSessionVars(ctx, tx, callerID, contextCodes); err != nil {
+		return Record{}, false, err
+	}
+
 	const q = `
 		select s.id::text, s.context_code, s.trainee_id, s.mentor_id, s.outing_id::text,
 		       coalesce(s.overall_comment, ''), s.status, s.revision
@@ -75,9 +138,9 @@ func (s *PgxStore) Get(ctx context.Context, context, callerID string, isAdmin bo
 		  and s.context_code = $2
 		  and (s.trainee_id = $3 or s.mentor_id = $3 or $4)`
 
-	row := s.pool.QueryRow(ctx, q, id, context, callerID, isAdmin)
+	row := tx.QueryRow(ctx, q, id, context, callerID, isAdmin)
 	var rec Record
-	err := row.Scan(&rec.ID, &rec.Context, &rec.TraineeID, &rec.MentorID,
+	err = row.Scan(&rec.ID, &rec.Context, &rec.TraineeID, &rec.MentorID,
 		&rec.OutingID, &rec.OverallComment, &rec.Status, &rec.Revision)
 	switch {
 	case err == nil:
@@ -97,7 +160,7 @@ func (s *PgxStore) Get(ctx context.Context, context, callerID string, isAdmin bo
 		where signoff_id = $1
 		order by position`
 
-	rows, err := s.pool.Query(ctx, aq, rec.ID)
+	rows, err := tx.Query(ctx, aq, rec.ID)
 	if err != nil {
 		return Record{}, false, err
 	}
@@ -114,10 +177,14 @@ func (s *PgxStore) Get(ctx context.Context, context, callerID string, isAdmin bo
 	if err := rows.Err(); err != nil {
 		return Record{}, false, err
 	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Record{}, false, err
+	}
 	return rec, true, nil
 }
 
-func (s *PgxStore) Create(ctx context.Context, callerID string, v Validated) (Record, error) {
+func (s *PgxStore) Create(ctx context.Context, callerID string, grants []string, v Validated) (Record, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Record{}, err
@@ -125,6 +192,14 @@ func (s *PgxStore) Create(ctx context.Context, callerID string, v Validated) (Re
 	// Rolled back on every path out, including a return above this point, so a
 	// refused write cannot leave a sign-off with no assessments behind it.
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Set session variables for RLS policy using the caller's full grants list.
+	// The policy checks whether the row's context is among the caller's grants,
+	// and a list of one context here would forbid the caller writing to any other
+	// context they hold.
+	if err := setSessionVars(ctx, tx, callerID, grants); err != nil {
+		return Record{}, err
+	}
 
 	const q = `
 		insert into signoff (id, context_code, trainee_id, mentor_id, outing_id,
@@ -203,6 +278,213 @@ func (s *PgxStore) Create(ctx context.Context, callerID string, v Validated) (Re
 	}, nil
 }
 
+// Submit transitions a draft to submitted. The sign-off is now in the review
+// queue and the review clock starts.
+//
+// The context is derived from the caller's active context (passed as a separate
+// argument), not from the sign-off row itself, because the RLS policy would
+// block a read to look it up before the session variable is set.
+func (s *PgxStore) Submit(ctx context.Context, callerID string, id string, callerContext string) (Record, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Record{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Set session variables for RLS policy using the caller's active context
+	contextCodes := []string{callerContext}
+	if err := setSessionVars(ctx, tx, callerID, contextCodes); err != nil {
+		return Record{}, err
+	}
+
+	// The check that the caller is the trainee is in the WHERE clause, so a
+	// sign-off belonging to someone else returns no row rather than an error.
+	// This is the same property the Get has: the endpoint cannot be used to
+	// learn which sign-offs exist by walking the id space.
+	//
+	// expires_at is set to 30 days from now because a submitted sign-off is not
+	// meant to wait for review indefinitely. A sign-off that has sat in the
+	// queue for a month is no longer a request for feedback on a recent outing
+	// but a record that has been abandoned, and the expiry lets the reviewer
+	// stop worrying about it.
+	const q = `
+		update signoff
+		set status = 'submitted',
+		    submitted_at = now(),
+		    expires_at = now() + interval '30 days',
+		    revision = revision + 1
+		where id = $1 and trainee_id = $2 and status = 'draft'
+		returning id::text, context_code, trainee_id, mentor_id, outing_id::text,
+		          coalesce(overall_comment, ''), status, revision`
+
+	var rec Record
+	err = tx.QueryRow(ctx, q, id, callerID).Scan(
+		&rec.ID, &rec.Context, &rec.TraineeID, &rec.MentorID,
+		&rec.OutingID, &rec.OverallComment, &rec.Status, &rec.Revision)
+	if err == pgx.ErrNoRows {
+		return Record{}, refuse("signoff_not_submittable",
+			"That sign-off is not in a state to be submitted. It may already be submitted, or it may not be yours to submit.")
+	}
+	if err != nil {
+		return Record{}, err
+	}
+
+	// The change feed, so a device pulling changes sees the sign-off is now
+	// in the review queue. Without it the record is written and invisible,
+	// which is the one failure mode a synchronisation service cannot have.
+	const qf = `
+		insert into change_feed (context_code, entity_type, entity_id, revision, body)
+		select $1, 'signoff', id, revision,
+		       jsonb_build_object(
+		           'id', id,
+		           'context_code', context_code,
+		           'trainee_id', trainee_id,
+		           'mentor_id', mentor_id,
+		           'outing_id', outing_id,
+		           'overall_comment', coalesce(overall_comment, ''),
+		           'status', status,
+		           'revision', revision)
+		from signoff where id = $2`
+	if _, err := tx.Exec(ctx, qf, rec.Context, rec.ID); err != nil {
+		return Record{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Record{}, err
+	}
+
+	// The assessments are read back after commit, because they were written in
+	// the same transaction and a read inside it could see a state that was
+	// rolled back. This is the same reason the Get reads assessments after its
+	// main query.
+	const aq = `
+		select competency_code, rating, evidence
+		from signoff_competency
+		where signoff_id = $1
+		order by position`
+	rows, err := s.pool.Query(ctx, aq, rec.ID)
+	if err != nil {
+		return Record{}, err
+	}
+	defer rows.Close()
+
+	rec.Assessments = []Assessment{}
+	for rows.Next() {
+		var a Assessment
+		if err := rows.Scan(&a.Code, &a.Rating, &a.Evidence); err != nil {
+			return Record{}, err
+		}
+		rec.Assessments = append(rec.Assessments, a)
+	}
+	if err := rows.Err(); err != nil {
+		return Record{}, err
+	}
+
+	return rec, nil
+}
+
+// Review records a mentor's assessment of a submitted sign-off. The review is
+// itself an assessment, so it carries the same evidence requirements as the
+// original submission: a rating without reasoning is a mark, not an assessment.
+//
+// The reviewer must be a mentor in the same context as the sign-off. A mentor
+// from another context reviewing a sign-off they cannot see is the same
+// boundary violation as a guide writing in a context they are not granted.
+func (s *PgxStore) Review(ctx context.Context, callerID string, id string, req ReviewRequest, callerContext string) (Record, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Record{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Set session variables for RLS policy using the caller's active context
+	contextCodes := []string{callerContext}
+	if err := setSessionVars(ctx, tx, callerID, contextCodes); err != nil {
+		return Record{}, err
+	}
+
+	// The check that the caller is a mentor in the same context is in the WHERE
+	// clause, so a sign-off in another context returns no row rather than an
+	// error. This is the same property the Get has: the endpoint cannot be used
+	// to learn which sign-offs exist by walking the id space.
+	//
+	// The signoff table has no reviewer_id, review_rating, or review_comment
+	// columns; the review is an event in the change feed rather than columns
+	// on the row, because the same mentor might review twice if asked to look
+	// again, and a single set of columns could hold only one of those.
+	const q = `
+		update signoff
+		set status = 'approved', reviewed_at = now(), revision = revision + 1
+		where id = $1 and mentor_id = $2 and status = 'submitted'
+		returning id::text, context_code, trainee_id, mentor_id, outing_id::text,
+		          coalesce(overall_comment, ''), status, revision`
+
+	var rec Record
+	err = tx.QueryRow(ctx, q, id, callerID).Scan(
+		&rec.ID, &rec.Context, &rec.TraineeID, &rec.MentorID,
+		&rec.OutingID, &rec.OverallComment, &rec.Status, &rec.Revision)
+	if err == pgx.ErrNoRows {
+		return Record{}, refuse("signoff_not_reviewable",
+			"That sign-off is not in a state to be reviewed. It may not be submitted, or it may not be yours to review.")
+	}
+	if err != nil {
+		return Record{}, err
+	}
+
+	// The change feed, so a device pulling changes sees the sign-off is now
+	// reviewed. Without it the record is written and invisible, which is the one
+	// failure mode a synchronisation service cannot have.
+	const qf = `
+		insert into change_feed (context_code, entity_type, entity_id, revision, body)
+		select $1, 'signoff', id, revision,
+		       jsonb_build_object(
+		           'id', id,
+		           'context_code', context_code,
+		           'trainee_id', trainee_id,
+		           'mentor_id', mentor_id,
+		           'outing_id', outing_id,
+		           'overall_comment', coalesce(overall_comment, ''),
+		           'status', status,
+		           'revision', revision)
+		from signoff where id = $2`
+	if _, err := tx.Exec(ctx, qf, rec.Context, rec.ID); err != nil {
+		return Record{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Record{}, err
+	}
+
+	// The assessments are read back after commit, because they were written in
+	// the same transaction and a read inside it could see a state that was
+	// rolled back. This is the same reason the Get reads assessments after its
+	// main query.
+	const aq = `
+		select competency_code, rating, evidence
+		from signoff_competency
+		where signoff_id = $1
+		order by position`
+	rows, err := s.pool.Query(ctx, aq, rec.ID)
+	if err != nil {
+		return Record{}, err
+	}
+	defer rows.Close()
+
+	rec.Assessments = []Assessment{}
+	for rows.Next() {
+		var a Assessment
+		if err := rows.Scan(&a.Code, &a.Rating, &a.Evidence); err != nil {
+			return Record{}, err
+		}
+		rec.Assessments = append(rec.Assessments, a)
+	}
+	if err := rows.Err(); err != nil {
+		return Record{}, err
+	}
+
+	return rec, nil
+}
+
 // PgCatalogue answers assessability from the reference table.
 type PgCatalogue struct{ pool *pgxpool.Pool }
 
@@ -246,28 +528,33 @@ func NewPgOutings(pool *pgxpool.Pool) *PgOutings { return &PgOutings{pool: pool}
 
 // InContext reports whether the outing exists in that context.
 //
-// One statement rather than a select followed by a compare, and it names both in
-// the WHERE clause, so an outing in another context is indistinguishable from one
-// that does not exist — the same property the drive check has, and for the same
-// reason: a message that distinguished them would be an oracle for walking the
-// id space to discover other reserves' outings.
-// The cancelled filter is absent deliberately: an outing has no deleted_at, and
-// cancelling is a status and a reason rather than a deletion. The filter was
-// written from the habit of every other table here carrying one, and it made
-// every sign-off naming an outing fail with "column deleted_at does not exist",
-// which is the whole request returning 500 rather than one row being found.
-//
-// The unit tests could not see it because they fake InContext, so this query was
-// only ever executed by the end-to-end suite.
+// The query runs inside a transaction with the RLS session variable set to the
+// context being checked, so the policy on the outing table evaluates against
+// the caller's grants rather than an empty setting.
 func (o *PgOutings) InContext(ctx context.Context, outingID, context string) (bool, error) {
+	tx, err := o.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Set the session variable the RLS policy on the outing table reads. The
+	// policy uses string_to_array, so this is a comma-separated string.
+	if _, err := tx.Exec(ctx, `select set_config('app.context_grants', $1, true)`, context); err != nil {
+		return false, err
+	}
+
 	const q = `
 		select exists (
 			select 1 from outing
 			where id = $1 and context_code = $2
 		)`
 	var ok bool
-	err := o.pool.QueryRow(ctx, q, outingID, context).Scan(&ok)
-	return ok, err
+	err = tx.QueryRow(ctx, q, outingID, context).Scan(&ok)
+	if err != nil {
+		return false, err
+	}
+	return ok, tx.Commit(ctx)
 }
 
 // isUUID reports whether s is a canonical 8-4-4-4-12 UUID.

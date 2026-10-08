@@ -7,3 +7,10 @@
 # because an ignored file is invisible to it.
 /field-service
 /dist/
+
+# Stray builds copied out of the tree for side-by-side comparison. The whole
+# point of the repository is that the build is reproducible, so no compiled
+# field-service binary should ever be tracked, whatever it is named.
+/bin/
+/field-service-new
+/field-service-updated

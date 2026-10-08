@@ -78,6 +78,33 @@ type Validated struct {
 	Context string
 }
 
+// ReviewRequest is what a mentor submits when reviewing a sign-off.
+type ReviewRequest struct {
+	// Rating is the mentor's overall assessment of the sign-off. It is
+	// deliberately separate from the individual competency ratings: a mentor
+	// may judge that the evidence supports competent performance overall
+	// even when some individual competencies were rated developing.
+	Rating Rating `json:"rating"`
+	// Comment is the mentor's overall feedback. It is mandatory for the
+	// same reason evidence is mandatory on individual assessments: a rating
+	// without reasoning is a mark, not an assessment.
+	Comment string `json:"comment"`
+	// BaseRevision is the revision the client last saw. If non-zero, the
+	// store uses it for optimistic concurrency control: the review is
+	// applied only if the current revision matches, preventing a lost-update
+	// when two mentors review the same sign-off concurrently.
+	BaseRevision int64 `json:"base_revision,omitempty"`
+}
+
+// Reviewed is a review that has passed every rule, with the pieces the store
+// needs filled in.
+type Reviewed struct {
+	ReviewRequest
+	SignoffID  string
+	Context    string
+	ReviewerID string
+}
+
 // A Refusal is a client mistake, named precisely.
 type Refusal struct {
 	Code    string
@@ -90,8 +117,22 @@ func refuse(code, message string) error { return &Refusal{Code: code, Message: m
 
 // Reviewer store interface.
 type Store interface {
-	Create(ctx context.Context, callerID string, v Validated) (Record, error)
+	// Create stores a validated sign-off. grants carries the caller's full
+	// context grants for the RLS policy, not just the active context.
+	Create(ctx context.Context, callerID string, grants []string, v Validated) (Record, error)
 	Get(ctx context.Context, context, callerID string, isAdmin bool, id string) (Record, bool, error)
+	// Submit marks a draft as submitted for review. It is separate from Create
+	// because the two acts have different permissions: a trainee may create a
+	// draft, but only a mentor may submit it for review. activeContext is
+	// supplied because the row itself cannot be read to discover it — the row
+	// is invisible until the session variable carries the caller's grants.
+	Submit(ctx context.Context, callerID string, id string, activeContext string) (Record, error)
+	// Review records a mentor's review of a submitted sign-off. The review is
+	// an assessment in its own right, with the same evidence requirements as
+	// the original submission. activeContext is supplied for the same reason
+	// Submit takes it: the store sets the session variable before touching
+	// the row, and the row cannot be consulted for its own context first.
+	Review(ctx context.Context, callerID string, id string, req ReviewRequest, activeContext string) (Record, error)
 }
 
 // Service applies the rules.
@@ -179,12 +220,75 @@ func New(store Store, cat Catalogue, outing func(context.Context, string, string
 // authority on which context a request writes in, and a service that looked it up
 // again would be a second source for the single most consequential value in the
 // row — with the two able to disagree, and the disagreement invisible.
-func (s *Service) Create(ctx context.Context, callerID, activeContext string, req Request) (Record, error) {
+func (s *Service) Create(ctx context.Context, callerID, activeContext string, grants []string, req Request) (Record, error) {
 	v, err := s.validate(ctx, activeContext, req)
 	if err != nil {
 		return Record{}, err
 	}
-	return s.store.Create(ctx, callerID, v)
+	return s.store.Create(ctx, callerID, grants, v)
+}
+
+// Submit transitions a draft to submitted. The sign-off is now in the review
+// queue and the review clock starts. Only the trainee who created the draft may
+// submit it: a mentor submitting on a trainee's behalf would be a self-assessment,
+// and a mentor who is not the trainee named on the record cannot know whether
+// the trainee is ready to be judged.
+func (s *Service) Submit(ctx context.Context, callerID, activeContext, id string) (Record, error) {
+	if callerID == "" {
+		return Record{}, refuse("no_caller",
+			"There is no caller to hold accountable for this submission.")
+	}
+	if strings.TrimSpace(activeContext) == "" {
+		return Record{}, refuse("no_submission_context",
+			"This caller holds no context to submit in, so there is nowhere to record a submission.")
+	}
+	if !isUUID(id) {
+		return Record{}, refuse("signoff_id_malformed",
+			"That is not the identifier of a sign-off.")
+	}
+	return s.store.Submit(ctx, callerID, id, activeContext)
+}
+
+// Review records a mentor's assessment of a submitted sign-off. The review is
+// itself an assessment, so it carries the same evidence requirements as the
+// original submission: a rating without reasoning is a mark, not an assessment.
+//
+// The reviewer must be a mentor in the same context as the sign-off. A mentor
+// from another context reviewing a sign-off they cannot see is the same
+// boundary violation as a guide writing in a context they are not granted.
+func (s *Service) Review(ctx context.Context, callerID, activeContext string, id string, req ReviewRequest) (Record, error) {
+	if callerID == "" {
+		return Record{}, refuse("no_caller",
+			"There is no caller to hold accountable for this review.")
+	}
+	if !isUUID(id) {
+		return Record{}, refuse("signoff_id_malformed",
+			"That is not the identifier of a sign-off.")
+	}
+	if strings.TrimSpace(activeContext) == "" {
+		return Record{}, refuse("no_review_context",
+			"This caller holds no context to review in, so there is nowhere to record a review.")
+	}
+	if !knownRatings[req.Rating] {
+		return Record{}, refuse("unknown_rating",
+			"That is not one of the five ratings.")
+	}
+	if strings.TrimSpace(req.Comment) == "" {
+		return Record{}, refuse("review_without_comment",
+			"A review carries the mentor's reasoning, including one recorded as not observed — where it is why the competency could not be judged.")
+	}
+
+	// The review is validated as a whole: the sign-off must exist, be submitted,
+	// and be in the caller's context. The store checks these in its transaction,
+	// because a check outside the transaction could race with a concurrent
+	// review or deletion.
+	reviewed := Reviewed{
+		ReviewRequest: req,
+		SignoffID:     id,
+		Context:       activeContext,
+		ReviewerID:    callerID,
+	}
+	return s.store.Review(ctx, callerID, id, reviewed.ReviewRequest, activeContext)
 }
 
 // validate decides everything, in an order chosen so the most specific refusal

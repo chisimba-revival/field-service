@@ -156,7 +156,9 @@ func aCreate(id, drive, species string, count int) push.Operation {
 	}
 }
 
-func northCaller() push.Caller { return push.Caller{ID: "user-1", WriteContext: ctxNorth} }
+func northCaller() push.Caller {
+	return push.Caller{ID: "user-1", WriteContext: ctxNorth, Grants: []string{ctxNorth}}
+}
 
 // A create is applied, and lands in the caller's context rather than anywhere
 // the client chose.
@@ -683,8 +685,7 @@ func TestACreateMissingItsDriveIsRefusedRatherThanFailingTheBatch(t *testing.T) 
 	op := aCreate("op-no-drive", outingNorth, "LEOP", 2)
 	delete(op.Payload, "outing_id")
 
-	got, err := svc.Push(context.Background(),
-		push.Caller{ID: "user-1", WriteContext: ctxNorth}, []push.Operation{op})
+	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{op})
 	if err != nil {
 		t.Fatalf("one bad operation failed the batch: %v", err)
 	}
@@ -706,8 +707,7 @@ func TestAGoodOperationInTheSameBatchStillLands(t *testing.T) {
 	delete(bad.Payload, "outing_id")
 	good := aCreate("op-fine", outingNorth, "LION", 1)
 
-	got, err := svc.Push(context.Background(),
-		push.Caller{ID: "user-1", WriteContext: ctxNorth},
+	got, err := svc.Push(context.Background(), northCaller(),
 		[]push.Operation{bad, good})
 	if err != nil {
 		t.Fatal(err)
@@ -742,8 +742,7 @@ func TestCapturedAndRecordedTimesAreNotTheSameFact(t *testing.T) {
 	op.CapturedAt = captured
 	op.RecordedAt = written
 
-	got, err := svc.Push(context.Background(),
-		push.Caller{ID: "user-1", WriteContext: ctxNorth}, []push.Operation{op})
+	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{op})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -53,10 +53,13 @@ end $$;
 -- rather than merely stale.
 do $$
 begin
-  if exists (select 1 from pg_constraint where conname = 'drive_status_known') then
+  -- Check for the constraint on the outing table specifically, since the table
+  -- was renamed from drive to outing. The constraint name might be either the
+  -- old name (if first run) or the new name (if re-run).
+  if exists (select 1 from pg_constraint where conname = 'drive_status_known' and conrelid = 'public.outing'::regclass) then
     alter table outing rename constraint drive_status_known to outing_status_known;
   end if;
-  if exists (select 1 from pg_policies where policyname = 'drive_in_granted_context') then
+  if exists (select 1 from pg_policies where policyname = 'drive_in_granted_context' and tablename = 'outing') then
     alter policy drive_in_granted_context on outing rename to outing_in_granted_context;
   end if;
 end $$;

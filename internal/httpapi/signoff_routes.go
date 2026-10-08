@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 
 	"field-service/internal/signoff"
 )
@@ -36,19 +35,26 @@ type Signoffs struct {
 // NewSignoffRoutes builds the sign-off routes, already wrapped in the guard.
 func NewSignoffRoutes(g *Guard, s *Signoffs) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/api/v1/signoffs", g.Serve(s.createHandler()))
-	// The read a trainee needs to actually receive the feedback. Without it the
-	// change feed tells a device a sign-off changed and leaves it with nothing to
-	// fetch, so the trainee would be told they had been assessed and not what of.
-	mux.Handle("/api/v1/signoffs/", g.Serve(s.getHandler()))
+	// Create a draft. The trainee owns this, and only the trainee may file it.
+	mux.Handle("POST /api/v1/signoffs", g.Serve(s.createHandler()))
+	// Read one sign-off. The trainee, the mentor, and an administrator in the
+	// same context may read; anyone else gets not found, so the endpoint cannot
+	// be used to learn which sign-offs exist.
+	mux.Handle("GET /api/v1/signoffs/{id}", g.Serve(s.getHandler()))
+	// Submit for review. The trainee who created the draft does this; a mentor
+	// submitting on their behalf would be a self-assessment.
+	mux.Handle("POST /api/v1/signoffs/{id}/submit", g.Serve(s.submitHandler()))
+	// Review a submitted sign-off. The mentor who wrote the original does this;
+	// the review is itself an assessment with the same evidence requirements.
+	mux.Handle("POST /api/v1/signoffs/{id}/review", g.Serve(s.reviewHandler()))
 	return mux
 }
 
 // getHandler serves one sign-off to a caller entitled to see it.
 func (s *Signoffs) getHandler() Handler {
 	return func(w http.ResponseWriter, r *http.Request, c Caller) error {
-		id := strings.TrimPrefix(r.URL.Path, "/api/v1/signoffs/")
-		if id == "" || strings.Contains(id, "/") {
+		id := r.PathValue("id")
+		if id == "" {
 			return problem(w, http.StatusNotFound, "unknown_signoff",
 				"No sign-off was named.")
 		}
@@ -101,10 +107,11 @@ func (s *Signoffs) createHandler() Handler {
 				"That body carried more than one sign-off.")
 		}
 
-		// A refusal is a client mistake and is answered with its own code; a fault
-		// is logged and answered without description. An error is never a refusal,
-		// so the two are distinguished here rather than guessed at by the store.
-		rec, err := s.Signoffs.Create(r.Context(), c.Subject(), c.ActiveContext(), req)
+		// The sign-off is written in the caller's active context. The store gets
+		// the full grants list because the RLS policy checks whether the row's
+		// context is among the caller's grants — a list of one context here would
+		// forbid writing to any other context the caller holds.
+		rec, err := s.Signoffs.Create(r.Context(), c.Subject(), c.ActiveContext(), c.Grants(), req)
 		if err != nil {
 			var ref *signoff.Refusal
 			if errors.As(err, &ref) {
@@ -114,6 +121,70 @@ func (s *Signoffs) createHandler() Handler {
 		}
 
 		return writeJSON(w, http.StatusCreated, rec)
+	}
+}
+
+// submitHandler transitions a draft to submitted. The sign-off is now in the
+// review queue and the review clock starts.
+func (s *Signoffs) submitHandler() Handler {
+	return func(w http.ResponseWriter, r *http.Request, c Caller) error {
+		id := r.PathValue("id")
+		if id == "" {
+			return problem(w, http.StatusNotFound, "unknown_signoff",
+				"No sign-off was named.")
+		}
+
+		rec, err := s.Signoffs.Submit(r.Context(), c.Subject(), c.ActiveContext(), id)
+		if err != nil {
+			var ref *signoff.Refusal
+			if errors.As(err, &ref) {
+				return problem(w, statusForRefusal(ref.Code), ref.Code, ref.Message)
+			}
+			return s.internal(w, r, err)
+		}
+
+		return writeJSON(w, http.StatusOK, rec)
+	}
+}
+
+// reviewHandler records a mentor's assessment of a submitted sign-off. The
+// review is itself an assessment, so it carries the same evidence requirements
+// as the original submission.
+func (s *Signoffs) reviewHandler() Handler {
+	return func(w http.ResponseWriter, r *http.Request, c Caller) error {
+		id := r.PathValue("id")
+		if id == "" {
+			return problem(w, http.StatusNotFound, "unknown_signoff",
+				"No sign-off was named.")
+		}
+
+		var req signoff.ReviewRequest
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxSignoffBody))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return problem(w, http.StatusRequestEntityTooLarge, "body_too_large",
+					"That review is too long to accept.")
+			}
+			return problem(w, http.StatusBadRequest, "unreadable_body",
+				"That review could not be read. The field names must match exactly.")
+		}
+		if dec.More() {
+			return problem(w, http.StatusBadRequest, "unreadable_body",
+				"That body carried more than one review.")
+		}
+
+		rec, err := s.Signoffs.Review(r.Context(), c.Subject(), c.ActiveContext(), id, req)
+		if err != nil {
+			var ref *signoff.Refusal
+			if errors.As(err, &ref) {
+				return problem(w, statusForRefusal(ref.Code), ref.Code, ref.Message)
+			}
+			return s.internal(w, r, err)
+		}
+
+		return writeJSON(w, http.StatusOK, rec)
 	}
 }
 

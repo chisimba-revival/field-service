@@ -32,6 +32,8 @@ import (
 	"field-service/internal/competency"
 	"field-service/internal/httpapi"
 	"field-service/internal/jwks"
+	"field-service/internal/media"
+	"field-service/internal/outings"
 	"field-service/internal/pull"
 	"field-service/internal/push"
 	"field-service/internal/signoff"
@@ -132,7 +134,10 @@ func run() error {
 		Log: logAdapter{log},
 	}
 
+	// Sign-off routes use Go 1.22+ method-based routing (POST /api/v1/signoffs,
+	// GET /api/v1/signoffs/{id}, etc.) registered on a sub-mux.
 	mux.Handle("/api/v1/signoffs", httpapi.NewSignoffRoutes(guard, signoffs))
+	mux.Handle("/api/v1/signoffs/", httpapi.NewSignoffRoutes(guard, signoffs))
 	mux.Handle("/api/v1/species", httpapi.NewCatalogueRoutes(guard, catalogue))
 	mux.Handle("/api/v1/species/", httpapi.NewCatalogueRoutes(guard, catalogue))
 
@@ -144,7 +149,25 @@ func run() error {
 	mux.Handle("/api/v1/competencies", httpapi.NewCompetencyRoutes(guard, comps))
 	mux.Handle("/api/v1/competencies/", httpapi.NewCompetencyRoutes(guard, comps))
 
-	// The verification door, reached only with a service token. It takes the pool
+	// Outings are reference data scoped to the caller's context grants.
+	// The Serve() handler uses method-based routing internally.
+	outingsStore := outings.NewStore(pool)
+	mux.Handle("/api/v1/outings", httpapi.NewOutingsRoutes(guard, outingsStore).Serve())
+	mux.Handle("/api/v1/outings/", httpapi.NewOutingsRoutes(guard, outingsStore).Serve())
+
+	// Media upload URLs. The backend is chosen from config: chisimba (the
+	// default) points devices at the gateway's own file API, s3 points them
+	// directly at an object store. The service is built once here because
+	// a target request does not touch the database.
+	var mediaBackend media.Backend
+	switch cfg.mediaBackend {
+	case "s3":
+		mediaBackend = media.NewS3(nil, cfg.mediaBucket, cfg.mediaPrefix)
+	default: // "chisimba" and anything unrecognised
+		mediaBackend = media.NewChisimba(cfg.mediaGatewayURL)
+	}
+	mediaRoutes := &httpapi.Media{Media: media.New(mediaBackend), Log: logAdapter{log}}
+	mux.Handle("/api/v1/media/", httpapi.NewMediaRoutes(guard, mediaRoutes))
 	// and not the session's read handle: a service token carries no context, so
 	// there are no grants to set and every context rule it applies is written in
 	// the request rather than inherited from the token.
@@ -160,6 +183,21 @@ func run() error {
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// Default handler for unmatched routes - returns standardized 404 error
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not_found","message":"That endpoint does not exist.","timestamp":"` + time.Now().UTC().Format(time.RFC3339) + `"}`))
+			return
+		}
+		// Root endpoint returns service info
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"service":"field-service","version":"1.0.0","status":"operational"}`))
 	})
 
 	srv := &http.Server{
@@ -201,14 +239,18 @@ func run() error {
 
 // config is the service's whole configuration surface.
 type config struct {
-	listen      string
-	databaseURL string
-	redisAddr   string
-	jwksURL     string
-	issuer      string
-	audience    string
-	scope       string
-	jwksRefresh time.Duration
+	listen          string
+	databaseURL     string
+	redisAddr       string
+	jwksURL         string
+	issuer          string
+	audience        string
+	scope           string
+	jwksRefresh     time.Duration
+	mediaBackend    string
+	mediaGatewayURL string
+	mediaBucket     string
+	mediaPrefix     string
 }
 
 // configFromEnv reads configuration, refusing anything missing.
@@ -220,14 +262,18 @@ type config struct {
 // process declines to start rather than run misconfigured.
 func configFromEnv() (config, error) {
 	c := config{
-		listen:      env("FIELDSVC_LISTEN", ":8080"),
-		databaseURL: os.Getenv("FIELDSVC_DATABASE_URL"),
-		redisAddr:   env("FIELDSVC_REDIS_ADDR", "127.0.0.1:6379"),
-		jwksURL:     os.Getenv("FIELDSVC_JWKS_URL"),
-		issuer:      os.Getenv("FIELDSVC_ISSUER"),
-		audience:    os.Getenv("FIELDSVC_AUDIENCE"),
-		scope:       env("FIELDSVC_REQUIRED_SCOPE", "field:write"),
-		jwksRefresh: 15 * time.Minute,
+		listen:          env("FIELDSVC_LISTEN", ":8080"),
+		databaseURL:     os.Getenv("FIELDSVC_DATABASE_URL"),
+		redisAddr:       env("FIELDSVC_REDIS_ADDR", "127.0.0.1:6379"),
+		jwksURL:         os.Getenv("FIELDSVC_JWKS_URL"),
+		issuer:          os.Getenv("FIELDSVC_ISSUER"),
+		audience:        os.Getenv("FIELDSVC_AUDIENCE"),
+		scope:           env("FIELDSVC_REQUIRED_SCOPE", "field:write"),
+		jwksRefresh:     15 * time.Minute,
+		mediaBackend:    env("FIELDSVC_MEDIA_BACKEND", "chisimba"),
+		mediaGatewayURL: env("FIELDSVC_MEDIA_GATEWAY_URL", "http://web/api/v1"),
+		mediaBucket:     env("FIELDSVC_MEDIA_BUCKET", ""),
+		mediaPrefix:     env("FIELDSVC_MEDIA_PREFIX", "media/"),
 	}
 	for name, value := range map[string]string{
 		"FIELDSVC_DATABASE_URL": c.databaseURL,

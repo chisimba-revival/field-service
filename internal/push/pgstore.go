@@ -71,6 +71,9 @@ func (t *pgxTx) clock() time.Time {
 
 func (t *pgxTx) Commit(ctx context.Context) error   { return t.tx.Commit(ctx) }
 func (t *pgxTx) Rollback(ctx context.Context) error { return t.tx.Rollback(ctx) }
+func (t *pgxTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return t.tx.Exec(ctx, sql, args...)
+}
 
 // RecordedOutcome reads a previously recorded outcome.
 //

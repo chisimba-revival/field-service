@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"field-service/internal/push"
 )
 
@@ -42,7 +44,9 @@ func newTx() *fakeTx {
 }
 
 // aCaller is the caller every test uses unless it is testing the caller itself.
-func aCaller() push.Caller { return push.Caller{ID: "user-1", WriteContext: "reserve-north"} }
+func aCaller() push.Caller {
+	return push.Caller{ID: "user-1", WriteContext: "reserve-north", Grants: []string{"reserve-north"}}
+}
 
 func (f *fakeTx) Begin(context.Context) (push.Tx, error) {
 	if f.beginErr != nil {
@@ -89,6 +93,10 @@ func (f *fakeTx) Commit(context.Context) error {
 	return f.commitErr
 }
 func (f *fakeTx) Rollback(context.Context) error { f.rolls++; return nil }
+
+func (f *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
 
 // fakeStore hands Begin a tx it already holds.
 type fakeStore struct{ tx *fakeTx }
@@ -211,7 +219,7 @@ func TestARecordedOutcomeBelongsToTheCallerWhoEarnedIt(t *testing.T) {
 	// A different caller presenting the same operation id. If the lookup were
 	// not scoped by caller, this would be told the operation had been applied and
 	// would silently drop its own change.
-	got, err := svc.Push(ctx, push.Caller{ID: "user-2", WriteContext: "reserve-north"}, []push.Operation{anOperation("op-1")})
+	got, err := svc.Push(ctx, push.Caller{ID: "user-2", WriteContext: "reserve-north", Grants: []string{"reserve-north"}}, []push.Operation{anOperation("op-1")})
 	if err != nil {
 		t.Fatal(err)
 	}

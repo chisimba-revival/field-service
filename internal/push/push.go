@@ -37,6 +37,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // entityLogBookEntry is the wire name for one entry in a trainee's log book.
@@ -100,6 +102,12 @@ var (
 	// and a record written into an invented context is invisible to every guide
 	// who actually holds that grant.
 	ErrNoWriteContext = errors.New("push: token carries no active context")
+
+	// ErrNoGrants is returned when the caller's token names no context grants.
+	//
+	// A caller with no grants cannot read or write anything, so there is no
+	// point in proceeding.
+	ErrNoGrants = errors.New("push: token carries no context grants")
 
 	// ErrNoOperations is returned for an empty batch.
 	//
@@ -194,15 +202,17 @@ type Caller struct {
 	// write into a context it was not granted — there is nowhere to put one,
 	// which is the property being relied on rather than an omission.
 	WriteContext string
+
+	// Grants is the full set of context grants from the token. This is used to
+	// configure the transaction's visibility boundary (app.context_grants).
+	Grants []string
 }
 
 // usable reports whether this caller can be recorded at all.
 //
-// Both fields are required and for different reasons. A caller with no id
-// cannot own an outcome row. A caller with no active context cannot be granted
-// one either: the contract has a record's context come from the token, so a
-// token carrying none is not a caller who may write.
-func (c Caller) usable() bool { return c.ID != "" && c.WriteContext != "" }
+// All three fields are required: ID for ownership, WriteContext for the write
+// boundary, and Grants for the read boundary.
+func (c Caller) usable() bool { return c.ID != "" && c.WriteContext != "" && len(c.Grants) > 0 }
 
 // Store is the database work a push needs.
 //
@@ -227,6 +237,9 @@ type Tx interface {
 	// Apply performs one operation and records its outcome. Both writes MUST
 	// happen in this transaction.
 	Apply(ctx context.Context, caller Caller, op Operation) (Result, error)
+
+	// Exec executes a query without returning rows.
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
@@ -258,6 +271,9 @@ func (s *Service) Push(ctx context.Context, caller Caller, ops []Operation) ([]R
 	if caller.WriteContext == "" {
 		return nil, ErrNoWriteContext
 	}
+	if len(caller.Grants) == 0 {
+		return nil, ErrNoGrants
+	}
 	if len(ops) == 0 {
 		return nil, ErrNoOperations
 	}
@@ -269,6 +285,21 @@ func (s *Service) Push(ctx context.Context, caller Caller, ops []Operation) ([]R
 	// Rollback after a successful Commit is harmless in pgx and returns
 	// ErrTxClosed, which is not worth reporting; the commit's own error is.
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Set transaction-local visibility settings for RLS policies.
+	// This must happen before any query in the transaction.
+	rendered, err := joinGrants(caller.Grants)
+	if err != nil {
+		return nil, err
+	}
+	const grantsSetting = "app.context_grants"
+	const callerSetting = "app.caller_user_id"
+	if _, err := tx.Exec(ctx, `select set_config($1, $2, true)`, grantsSetting, rendered); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `select set_config($1, $2, true)`, callerSetting, caller.ID); err != nil {
+		return nil, err
+	}
 
 	results := make([]Result, 0, len(ops))
 	for _, op := range ops {
@@ -329,4 +360,25 @@ func deferral(op Operation, code string) Result {
 		Outcome:     OutcomeDeferred,
 		ErrorCode:   code,
 	}
+}
+
+// joinGrants renders a grant set as a comma-separated string for the
+// app.context_grants setting. It validates that no grant is empty or contains
+// a comma, which would break the setting format.
+func joinGrants(grants []string) (string, error) {
+	for _, g := range grants {
+		if g == "" {
+			return "", errors.New("push: an empty context code is not a grant")
+		}
+		for _, r := range g {
+			if r == ',' {
+				return "", errors.New("push: a context code containing a comma cannot be represented in the grants setting")
+			}
+		}
+	}
+	out := grants[0]
+	for _, g := range grants[1:] {
+		out += "," + g
+	}
+	return out, nil
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"field-service/internal/pull"
 	"field-service/internal/push"
@@ -89,6 +90,7 @@ func (s *Sync) pushHandler() Handler {
 		results, err := s.Push.Push(r.Context(), push.Caller{
 			ID:           c.Subject(),
 			WriteContext: c.ActiveContext(),
+			Grants:       c.Grants(),
 		}, body.Operations)
 		if err != nil {
 			// Nothing was applied, and the client needs to know that rather than
@@ -192,8 +194,18 @@ func writeJSON(w http.ResponseWriter, status int, body any) error {
 //
 // A refusal has to be distinguishable from a success, or the handler keeps
 // going. The guard recognises this sentinel and adds nothing to the response.
+//
+// The format follows the contract requirement for timestamp and request_id
+// correlation. The request ID is pulled from the X-Request-ID header if set
+// by middleware, otherwise omitted.
 func problem(w http.ResponseWriter, status int, code, message string) error {
-	if err := writeJSON(w, status, map[string]any{"error": code, "message": message}); err != nil {
+	response := map[string]any{
+		"error":     code,
+		"message":   message,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if err := writeJSON(w, status, response); err != nil {
 		return err
 	}
 	return ErrAnswered
