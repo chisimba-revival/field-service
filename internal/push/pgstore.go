@@ -120,13 +120,33 @@ func (t *pgxTx) Apply(ctx context.Context, caller Caller, op Operation) (Result,
 		// that adding an entity does not mean adding a case to every handler. A
 		// create names what it is creating; the handlers below each check that
 		// too, and refuse an entity they do not serve.
-		if op.Entity == "outing" {
+		switch op.Entity {
+		case "outing":
 			res, err = t.createOuting(ctx, caller, op)
-			break
+		case entityLogBookEntry:
+			res, err = t.create(ctx, caller, op)
+		case entityDangerousGameEncounter:
+			res, err = t.createEncounter(ctx, caller, op)
+		case entityTrailWaypoint:
+			res, err = t.createTrailWaypoint(ctx, caller, op)
+		default:
+			res = Result{
+				OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+				Outcome: OutcomeRefused, ErrorCode: "unsupported_entity",
+				ClientState: map[string]any{
+					"expected": []string{"outing", entityLogBookEntry,
+						entityDangerousGameEncounter, entityTrailWaypoint},
+				},
+			}
 		}
-		res, err = t.create(ctx, caller, op)
 	case "correct":
 		res, err = t.correct(ctx, caller, op)
+	case "update":
+		// An outing starts as a create, and its end — duration, hours by day and
+		// night, the off-road rollup — arrives later as an update against the
+		// revision the create returned. Nothing else is updatable: a waypoint is
+		// append-only by contract, and a sighting is corrected, never replaced.
+		res, err = t.updateOuting(ctx, caller, op)
 	default:
 		// Refused rather than deferred: a kind this build does not know will not
 		// become known by waiting, and deferring would keep the client retrying
@@ -464,8 +484,10 @@ func (t *pgxTx) feed(ctx context.Context, caller Caller, op Operation, revision 
 // only ever reached through this map, so an entity with no arm is an error
 // before anything is built, not a query against whatever the client named.
 var feedTables = map[string]string{
-	entityLogBookEntry: entityLogBookEntry,
-	"outing":           "outing",
+	entityLogBookEntry:           entityLogBookEntry,
+	"outing":                     "outing",
+	entityDangerousGameEncounter: entityDangerousGameEncounter,
+	entityTrailWaypoint:          "trail_waypoint",
 }
 
 func unsupported(op Operation, want string) Result {
@@ -541,6 +563,12 @@ func payloadFloat(m map[string]any, k string) float64 {
 }
 func payloadFloatPtr(m map[string]any, k string) *float64 {
 	if v, ok := m[k].(float64); ok {
+		return &v
+	}
+	return nil
+}
+func payloadBoolPtr(m map[string]any, k string) *bool {
+	if v, ok := m[k].(bool); ok {
 		return &v
 	}
 	return nil

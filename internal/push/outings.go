@@ -80,6 +80,9 @@ func (t *pgxTx) createOuting(ctx context.Context, caller Caller, op Operation) (
 	if err := requireFields(op, kind); err != nil {
 		return refusalFor(err, op)
 	}
+	if err := validateOptionalFieldRanges(op, kind); err != nil {
+		return refusalFor(err, op)
+	}
 	if err := t.insertOuting(ctx, caller, op, kind); err != nil {
 		return refusalFor(err, op)
 	}
@@ -124,8 +127,8 @@ func (t *pgxTx) insertOuting(ctx context.Context, caller Caller, op Operation, k
 	const q = `
 		insert into outing
 		  (id, context_code, kind, guide_id, trainee_ids, status,
-		   planned_start_time, start_time, end_time, route, weather, notes)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+		   planned_start_time, start_time, end_time, route, weather, notes, revision)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1)`
 
 	_, err := t.tx.Exec(ctx, q,
 		op.EntityID, caller.WriteContext, kind,
@@ -165,9 +168,20 @@ func (t *pgxTx) insertOutingDetail(ctx context.Context, op Operation, kind strin
 		duration := payloadFloatPtr(op.Payload, "duration_hours")
 		guests := payloadIntPtr(op.Payload, "guest_count")
 		_, err := t.tx.Exec(ctx,
-			`insert into drive_detail (outing_id, duration_hours, guest_count)
-			 values ($1, $2, $3)`,
-			op.EntityID, *duration, *guests)
+			`insert into drive_detail
+			   (outing_id, duration_hours, guest_count, vehicle_id,
+			    inspection_oil_ok, inspection_water_ok, inspection_tyres_ok,
+			    daylight_hours, night_hours, off_road_seconds, off_track_used)
+			 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			op.EntityID, *duration, *guests,
+			payloadTextPtr(op.Payload, "vehicle_id"),
+			payloadBoolPtr(op.Payload, "inspection_oil_ok"),
+			payloadBoolPtr(op.Payload, "inspection_water_ok"),
+			payloadBoolPtr(op.Payload, "inspection_tyres_ok"),
+			payloadFloatPtr(op.Payload, "daylight_hours"),
+			payloadFloatPtr(op.Payload, "night_hours"),
+			payloadIntPtr(op.Payload, "off_road_seconds"),
+			payloadBoolPtr(op.Payload, "off_track_used"))
 		return err
 
 	case "hike":
@@ -175,12 +189,15 @@ func (t *pgxTx) insertOutingDetail(ctx context.Context, op Operation, kind strin
 		length := payloadFloatPtr(op.Payload, "walk_length_km")
 		_, err := t.tx.Exec(ctx,
 			`insert into hike_detail
-			   (outing_id, rifle_role, walk_length_km, hours_walked, description, lessons_learned)
-			 values ($1, $2, $3, $4, $5, $6)`,
+			   (outing_id, rifle_role, walk_length_km, hours_walked, description,
+			    lessons_learned, guide_role, rifle_details)
+			 values ($1, $2, $3, $4, $5, $6, $7, $8)`,
 			op.EntityID, role, *length,
 			payloadFloatPtr(op.Payload, "hours_walked"),
 			payloadTextPtr(op.Payload, "description"),
-			payloadTextPtr(op.Payload, "lessons_learned"))
+			payloadTextPtr(op.Payload, "lessons_learned"),
+			payloadTextPtr(op.Payload, "guide_role"),
+			payloadTextPtr(op.Payload, "rifle_details"))
 		return err
 
 	case "camp":
@@ -230,6 +247,66 @@ func requireFields(op Operation, kind string) error {
 		// question, and so a camp can carry a site name when there is one.
 	}
 	return nil
+}
+
+// validateOptionalFieldRanges checks the optional fields this kind's detail
+// table holds to non-negative (or enumerated) rules.
+//
+// None of these fields is required, so requireFields does not see them — but
+// each has a check constraint in the schema, and a client that sends
+// daylight_hours = -3 would otherwise be answered with a constraint violation,
+// which fails the transaction and takes the whole batch down with it. Everything
+// the database would reject is rejected here, in Go, with a code the client can
+// act on, and the constraint stays in the schema as the schema's own backstop.
+func validateOptionalFieldRanges(op Operation, kind string) error {
+	switch kind {
+	case "drive":
+		if d := payloadFloatPtr(op.Payload, "daylight_hours"); d != nil && *d < 0 {
+			return missingField("drive_negative_daylight_hours")
+		}
+		if n := payloadFloatPtr(op.Payload, "night_hours"); n != nil && *n < 0 {
+			return missingField("drive_negative_night_hours")
+		}
+		if s := payloadIntPtr(op.Payload, "off_road_seconds"); s != nil && *s < 0 {
+			return missingField("drive_negative_off_road_seconds")
+		}
+
+	case "hike":
+		switch g := payloadText(op.Payload, "guide_role"); g {
+		case "", "lead", "backup":
+		default:
+			return missingField("hike_without_guide_role")
+		}
+		if h := payloadFloatPtr(op.Payload, "hours_walked"); h != nil && *h < 0 {
+			return missingField("hike_negative_hours_walked")
+		}
+	}
+	return nil
+}
+
+// validateUpdateFields checks an update's payload.
+//
+// An update is sparse: every field is optional, and the ones that are present
+// must be valid. This is requireFields run the other way round — presence is
+// decided by "did the client send it" rather than "is it missing" — and it
+// shares its codes with the create path, so a drive updated to a zero duration
+// is told the same thing as a drive created without one.
+func validateUpdateFields(op Operation, kind string) error {
+	if d := payloadFloatPtr(op.Payload, "duration_hours"); d != nil && *d <= 0 {
+		return missingField("drive_without_duration")
+	}
+	if g := payloadIntPtr(op.Payload, "guest_count"); g != nil && *g < 0 {
+		return missingField("drive_without_guest_count")
+	}
+	switch r := payloadText(op.Payload, "rifle_role"); r {
+	case "", "first", "second", "neither":
+	default:
+		return missingField("hike_without_rifle_role")
+	}
+	if l := payloadFloatPtr(op.Payload, "walk_length_km"); l != nil && *l <= 0 {
+		return missingField("hike_without_walk_length")
+	}
+	return validateOptionalFieldRanges(op, kind)
 }
 
 // missingField is a refusal carrying a code the client can act on.
