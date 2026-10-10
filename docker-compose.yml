@@ -51,5 +51,69 @@ services:
       timeout: 3s
       retries: 20
 
+  # One-shot schema migration. It runs to completion before field-service
+  # starts, so a fresh volume comes up with a schema rather than a connection
+  # error. The PostGIS image is reused only for its psql client; the migration
+  # files are the ones in the repository, so the order they run in is recorded
+  # in git rather than in somebody's shell history.
+  migrate:
+    image: postgis/postgis:16-3.5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: fieldsvc
+    volumes:
+      - ./migrations:/migrations:ro
+      - ./scripts:/scripts:ro
+    entrypoint: ["sh", "/scripts/migrate.sh"]
+    command: ["postgres://fieldsvc:fieldsvc@postgres:5432/fieldlog?sslmode=disable"]
+    restart: "no"
+
+  # The service itself. Its own PostGIS and Redis are reached over this
+  # project's default network; Chisimba's JWKS is reached over the external
+  # chisimba-dev network, where the web service is named `web`. It connects to
+  # Postgres as the fieldapp runtime role, never the migration superuser, so
+  # row-level security actually applies (see migrations/0002_runtime_role.sql).
+  field-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: field-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      FIELDSVC_DATABASE_URL: postgres://fieldapp:fieldsvc@postgres:5432/fieldlog?sslmode=disable
+      FIELDSVC_REDIS_ADDR: redis:6379
+      FIELDSVC_JWKS_URL: http://web/api/v1/auth/jwks
+      # These must match the claims Chisimba signs. They are the values in
+      # TokenAuthService ($issuer = 'chisimba', $audience = 'chisimba-api'),
+      # not the stale examples in FIELD_SERVICE_INTEGRATION_FINAL.md. A
+      # mismatch fails closed: every token is refused.
+      FIELDSVC_ISSUER: chisimba
+      FIELDSVC_AUDIENCE: chisimba-api
+      FIELDSVC_LISTEN: ":8080"
+      FIELDSVC_REQUIRED_SCOPE: field:write
+    ports:
+      - "8081:8080"
+    networks:
+      - default
+      - chisimba
+    restart: unless-stopped
+
 volumes:
   pgdata:
+
+networks:
+  default:
+  # The network the Chisimba stack (project `chisimba-dev`) creates. Marked
+  # external because this compose file does not own it; it must already be
+  # running, which it is whenever `web` is up.
+  chisimba:
+    external: true
+    name: chisimba-dev_default
