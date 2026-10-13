@@ -130,11 +130,11 @@ func TestAValidTokenIsAccepted(t *testing.T) {
 		t.Fatalf("a valid token was rejected: %v", err)
 	}
 
-	if principal.Subject != "user-1" {
-		t.Errorf("subject = %q, want user-1", principal.Subject)
+	if principal.Subject() != "user-1" {
+		t.Errorf("subject = %q, want user-1", principal.Subject())
 	}
-	if principal.ActiveContext != "reserve-north" {
-		t.Errorf("active context = %q, want reserve-north", principal.ActiveContext)
+	if principal.ActiveContext() != "reserve-north" {
+		t.Errorf("active context = %q, want reserve-north", principal.ActiveContext())
 	}
 	if len(principal.Grants) != 2 {
 		t.Errorf("grants = %v, want two", principal.Grants)

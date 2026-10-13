@@ -134,7 +134,7 @@ func (p Principal) GrantsContext(code string) bool {
 // so a caller can notice that situation and say so plainly, not to produce an
 // error the client cannot act on.
 func (p Principal) CanWriteToContext(code string) bool {
-	return p.ActiveContext != "" && p.ActiveContext == code && p.GrantsContext(code)
+	return p.Claims.ActiveContext != "" && p.Claims.ActiveContext == code && p.GrantsContext(code)
 }
 
 // KeyResolver supplies the public key for a key id.
@@ -280,16 +280,16 @@ func (v *Validator) Validate(token string) (Principal, error) {
 // It is a method rather than a field so that the "active context not granted"
 // case cannot be skipped by reading the field directly.
 func (p Principal) WriteContext() (string, bool) {
-	if p.ActiveContext == "" {
+	if p.Claims.ActiveContext == "" {
 		return "", false
 	}
-	if !p.GrantsContext(p.ActiveContext) {
+	if !p.GrantsContext(p.Claims.ActiveContext) {
 		// The grant was withdrawn between the token being minted and this
 		// request. The token is still valid for reading; a write would land in
 		// a context the caller no longer holds, so it is refused here.
 		return "", false
 	}
-	return p.ActiveContext, true
+	return p.Claims.ActiveContext, true
 }
 
 // checkAlgorithm refuses everything except RS256.
@@ -509,4 +509,16 @@ func ParsePublicKey(n, e string) (*rsa.PublicKey, error) {
 		N: new(big.Int).SetBytes(nBytes),
 		E: exponent,
 	}, nil
+}
+
+// ActiveContext returns the caller's active context from the token.
+// It is a method rather than a field access so callers go through the
+// defined interface rather than reaching into the embedded Claims.
+// Subject returns the subject claim of the token.
+func (p Principal) Subject() string {
+	return p.Claims.Subject
+}
+
+func (p Principal) ActiveContext() string {
+	return p.Claims.ActiveContext
 }

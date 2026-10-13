@@ -637,6 +637,205 @@ func TestASparseCorrectionLeavesUnmentionedFieldsAlone(t *testing.T) {
 
 func ptr[T any](v T) *T { return &v }
 
+// An amendment that is only a note must actually write.
+//
+// The client sends an amendment as the same keys create() reads, but for a
+// while correct() read none of them: a note-only amendment arrived carrying
+// nothing the operation looked at, every coalesce resolved to null, and the
+// client was told OutcomeApplied. A trainee who wrote three sentences into a
+// record in the field, synced, and found all three gone had no way to know
+// that hadn't happened, because the service said it had.
+func TestANoteOnlyAmendmentActuallyWrites(t *testing.T) {
+	adm := admin(t)
+	reset(t, adm)
+	seedOuting(t, adm, outingNorth, ctxNorth)
+
+	svc, conn := service(t, ctxNorth)
+	create := aCreate("op-note-amend", outingNorth, "LEOP", 5)
+	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
+		t.Fatal(err)
+	}
+
+	rev := int64(1)
+	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
+		OperationID: uuidFor("op-note-amend-corr"), Entity: "log_book_entry", Kind: "correct",
+		EntityID: create.EntityID, BaseRevision: &rev,
+		Payload: map[string]any{"notes": "a third calf followed the pair"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Outcome != push.OutcomeApplied {
+		t.Fatalf("outcome %q (%s); a note amendment has no reason to offer, "+
+			"so it has no path to a refusal", got[0].Outcome, got[0].ErrorCode)
+	}
+
+	var notes string
+	var revision int64
+	if err := conn.QueryRow(context.Background(),
+		`select notes, revision from log_book_entry where id = $1`, create.EntityID).
+		Scan(&notes, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if notes != "a third calf followed the pair" {
+		t.Errorf("notes are %q. The operation was applied, so the note is gone "+
+			"and the client was told otherwise.", notes)
+	}
+	if revision != 2 {
+		t.Errorf("revision is %d, want 2: an amendment that was applied moved the "+
+			"revision, and a client comparing revisions is what detects a conflict", revision)
+	}
+}
+
+// Behaviour and age/sex ride on the same vocabulary, so a correction carrying
+// them has to land.
+func TestAFieldAmendmentWritesTheFieldItNames(t *testing.T) {
+	adm := admin(t)
+	reset(t, adm)
+	seedOuting(t, adm, outingNorth, ctxNorth)
+
+	svc, conn := service(t, ctxNorth)
+	create := aCreate("op-field-amend", outingNorth, "LEOP", 5)
+	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
+		t.Fatal(err)
+	}
+
+	rev := int64(1)
+	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
+		OperationID: uuidFor("op-field-amend-corr"), Entity: "log_book_entry", Kind: "correct",
+		EntityID: create.EntityID, BaseRevision: &rev,
+		Payload: map[string]any{"behaviour": "hunting", "age_sex_class": "calf_cub"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Outcome != push.OutcomeApplied {
+		t.Fatalf("outcome %q (%s)", got[0].Outcome, got[0].ErrorCode)
+	}
+
+	var behaviour, ageSex string
+	if err := conn.QueryRow(context.Background(),
+		`select behaviour::text, age_sex_class::text from log_book_entry where id = $1`,
+		create.EntityID).Scan(&behaviour, &ageSex); err != nil {
+		t.Fatal(err)
+	}
+	if behaviour != "hunting" {
+		t.Errorf("behaviour is %q, want hunting", behaviour)
+	}
+	if ageSex != "calf_cub" {
+		t.Errorf("age_sex_class is %q, want calf_cub", ageSex)
+	}
+}
+
+// A later amendment that mentions no reason must not wipe the reason an earlier
+// correction gave.
+//
+// Overwriting it leaves recorded_species_code set with correction_reason null,
+// which is precisely what correction_has_reason forbids — so the honest version
+// of this bug was not a silent wipe but a dead batch, taking every other
+// operation in it down.
+func TestALaterAmendmentDoesNotEraseAnEarlierReason(t *testing.T) {
+	adm := admin(t)
+	reset(t, adm)
+	seedOuting(t, adm, outingNorth, ctxNorth)
+
+	svc, conn := service(t, ctxNorth)
+	create := aCreate("op-reason-amend", outingNorth, "LEOP", 5)
+	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
+		t.Fatal(err)
+	}
+
+	rev := int64(1)
+	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
+		OperationID: uuidFor("op-reason-amend-corr"), Entity: "log_book_entry", Kind: "correct",
+		EntityID: create.EntityID, BaseRevision: &rev,
+		Payload: map[string]any{"species_code": "LEOA", "correction_reason": "Forest, not savanna elephant."},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{{
+		OperationID: uuidFor("op-reason-amend-note"), Entity: "log_book_entry", Kind: "correct",
+		EntityID: create.EntityID, BaseRevision: ptr(int64(2)),
+		Payload: map[string]any{"notes": "recounted at dusk"},
+	}})
+	if err != nil {
+		t.Fatalf("a note on a corrected record failed the batch: %v", err)
+	}
+	if got[0].Outcome != push.OutcomeApplied {
+		t.Fatalf("outcome %q (%s)", got[0].Outcome, got[0].ErrorCode)
+	}
+
+	var reason, species, recorded string
+	if err := conn.QueryRow(context.Background(),
+		`select correction_reason, species_code, recorded_species_code from log_book_entry
+		 where id = $1`, create.EntityID).Scan(&reason, &species, &recorded); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "Forest, not savanna elephant." {
+		t.Errorf("the reason became %q. A reason is the only thing explaining "+
+			"why the record no longer says what it first said.", reason)
+	}
+	if species != "LEOA" || recorded != "LEOP" {
+		t.Errorf("species is now %q with original %q; the amendment must not have "+
+			"touched either", species, recorded)
+	}
+}
+
+// A behaviour this database has never heard of is refused by this one
+// operation.
+//
+// It cannot be left for Postgres to discover: the error an enum cast raises
+// fails the transaction, and everything else in the batch is lost with it.
+// Someone else's sighting, accepted in the same batch, is not this client's to
+// destroy.
+func TestAnUnknownBehaviourCodeIsRefusedWithoutFailingTheBatch(t *testing.T) {
+	adm := admin(t)
+	reset(t, adm)
+	seedOuting(t, adm, outingNorth, ctxNorth)
+
+	svc, conn := service(t, ctxNorth)
+	create := aCreate("op-bad-enum", outingNorth, "LEOP", 5)
+	if _, err := svc.Push(context.Background(), northCaller(), []push.Operation{create}); err != nil {
+		t.Fatal(err)
+	}
+	good := aCreate("op-bad-enum-bystander", outingNorth, "LION", 1)
+
+	rev := int64(1)
+	got, err := svc.Push(context.Background(), northCaller(), []push.Operation{
+		{
+			OperationID: uuidFor("op-bad-enum-corr"), Entity: "log_book_entry", Kind: "correct",
+			EntityID: create.EntityID, BaseRevision: &rev,
+			Payload: map[string]any{"behaviour": "grooming"},
+		},
+		good,
+	})
+	if err != nil {
+		t.Fatalf("one stale client failed the batch: %v", err)
+	}
+	if got[0].Outcome != push.OutcomeRefused {
+		t.Errorf("outcome %q, want refused", got[0].Outcome)
+	}
+	if got[0].ErrorCode != "unknown_behaviour" {
+		t.Errorf("code %q, want unknown_behaviour", got[0].ErrorCode)
+	}
+	if got[1].Outcome != push.OutcomeApplied {
+		t.Errorf("the bystander sighting came back %q", got[1].Outcome)
+	}
+
+	var behaviour string
+	if err := conn.QueryRow(context.Background(),
+		`select coalesce(behaviour::text, '') from log_book_entry where id = $1`,
+		create.EntityID).Scan(&behaviour); err != nil {
+		t.Fatal(err)
+	}
+	// The create seeded no behaviour, so the column is null. Anything other
+	// than that means the refused operation wrote after all.
+	if behaviour != "" {
+		t.Errorf("behaviour became %q; a refusal writes nothing", behaviour)
+	}
+}
+
 // integrationTestLock is the key this suite and the store suite both take.
 //
 // The same value in both, which is the whole point: two suites holding

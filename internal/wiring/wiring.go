@@ -55,7 +55,7 @@ type claims struct{ p authn.Principal }
 
 var _ httpapi.Principal = claims{}
 
-func (c claims) Subject() string { return c.p.Subject }
+func (c claims) Subject() string { return c.p.Subject() }
 
 // TokenType reports what the token was issued for: "access" for a person,
 // "service" for the platform acting for nobody in particular.
@@ -65,7 +65,7 @@ func (c claims) Subject() string { return c.p.Subject }
 // token that did not say", and those are not the same claim.
 func (c claims) TokenType() string     { return c.p.Type }
 func (c claims) Scopes() []string      { return c.p.Scope }
-func (c claims) ActiveContext() string { return c.p.ActiveContext }
+func (c claims) ActiveContext() string { return c.p.ActiveContext() }
 func (c claims) Grants() []string      { return c.p.Grants }
 func (c claims) Epoch() int64          { return c.p.Epoch }
 

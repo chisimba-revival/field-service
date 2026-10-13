@@ -1,0 +1,41 @@
+# Docker does not honour .gitignore. Without this file the build context sent to
+# the daemon carries every compiled artefact sitting in the tree — including the
+# four stray field-service builds (~78 MB) — plus the tests, the e2e suite and
+# the developer tooling. They are copied into a build layer by `COPY . .`, which
+# makes every build slower and ships sources into the image that then have to be
+# justified. .gitignore keeps them out of the repository; this keeps them out of
+# the image.
+
+# Version control and local state.
+.git
+.gitignore
+.env
+.env.*
+
+# Compiled output. The build is reproducible, so no binary belongs in an image.
+/field-service
+/field-service-new
+/field-service-updated
+/dist/
+/bin/
+
+# Tests and fixtures: exercised by `go test`, never needed to compile.
+/e2e/
+**/*_test.go
+
+# Developer tooling. cmd/fetchjwks and cmd/verify are operator utilities that
+# talk to a running stack; they are not part of the service and are excluded so
+# `go build ./cmd/field-service` remains the only package built.
+/cmd/fetchjwks/
+/cmd/verify/
+/cmd/verify2/
+/scripts/
+
+# Documentation is maintained alongside the code, not served from it.
+/docs/
+/*.md
+
+# Build definitions are inputs, not content.
+Dockerfile
+docker-compose.yml
+.dockerignore

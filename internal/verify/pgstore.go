@@ -141,6 +141,22 @@ func (s *PgxStore) Verify(ctx context.Context, req Request) (Result, error) {
 		return Result{}, err
 	}
 
+	// Write to change_feed so the verification propagates to devices on pull.
+	// The body is the serialised row rather than its identity: identity-only
+	// turns one page into N round trips over a connection that is already marginal.
+	var body []byte
+	if err := tx.QueryRow(ctx,
+		`select to_jsonb(t) from log_book_entry t where t.id = $1`, req.EntryID).
+		Scan(&body); err != nil {
+		return Result{}, err
+	}
+	if _, err := tx.Exec(ctx,
+		`insert into change_feed (context_code, entity_type, entity_id, revision, body)
+		 values ($1, 'log_book_entry', $2, $3, $4)`,
+		req.Context, req.EntryID, newRevision, body); err != nil {
+		return Result{}, err
+	}
+
 	res := Result{
 		OperationID: req.OperationID,
 		EntryID:     req.EntryID,

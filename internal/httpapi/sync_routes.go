@@ -57,11 +57,36 @@ type PushService interface {
 	Push(ctx context.Context, caller push.Caller, ops []push.Operation) ([]push.Result, error)
 }
 
-// NewSyncRoutes builds the two sync routes, each already wrapped in the guard.
+// NewSyncRoutes builds the two sync routes for the user door (person tokens).
 func NewSyncRoutes(g *Guard, sync *Sync) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/sync/push", g.Serve(sync.pushHandler()))
 	mux.Handle("/api/v1/sync/pull", g.Serve(sync.pullHandler()))
+	return mux
+}
+
+// NewSyncServiceRoutes builds the two sync routes for the service door (service tokens).
+func NewSyncServiceRoutes(g *Guard, sync *Sync, scope string) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/sync/push", g.ServeService(scope)(ServiceHandler(sync.pushHandler())))
+	mux.Handle("/api/v1/sync/pull", g.ServeService(scope)(ServiceHandler(sync.pullHandler())))
+	return mux
+}
+
+// NewSyncDispatchRoutes builds the two sync routes for whichever door the
+// token's type names. The same path serves a device syncing with the person's
+// own token and Chisimba's module syncing with a service token, so the guard
+// dispatches on the token rather than on the route.
+//
+// The person branch uses the guard's own required scope and the caller's
+// context grants; the service branch uses serviceScope and the token's active
+// context. Each is the same check the single-door constructors above apply.
+func NewSyncDispatchRoutes(g *Guard, sync *Sync, serviceScope string) http.Handler {
+	mux := http.NewServeMux()
+	push := sync.pushHandler()
+	pull := sync.pullHandler()
+	mux.Handle("/api/v1/sync/push", g.ServeDispatch(push, ServiceHandler(push), serviceScope))
+	mux.Handle("/api/v1/sync/pull", g.ServeDispatch(pull, ServiceHandler(pull), serviceScope))
 	return mux
 }
 

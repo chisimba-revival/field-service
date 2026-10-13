@@ -208,12 +208,59 @@ func (c *Cache) ResolveKey(keyID string) (*rsa.PublicKey, error) {
 	return nil, fmt.Errorf("jwks: no key for id %q", keyID)
 }
 
+// Warm loads the document before anything has asked for it.
+//
+// It exists for a boot race, not for latency. The service starts as soon as its
+// own dependencies are healthy, but the issuer is a separate deployment with no
+// ordering that guarantees it is serving yet. A cold cache is then not a slow
+// first request: ResolveKey serves a stale key only when it already holds one,
+// and nothing is held, so the first token is refused even though the document
+// arrives moments later.
+//
+// Best effort by construction. A failure is the caller's to log, not to abort
+// on, because ResolveKey fetches lazily on the first real key id either way: a
+// warm that never succeeds changes when the fetch happens rather than whether it
+// happens. For the same reason it must never gate a health probe — a liveness
+// check that fails because a dependency is down takes the container down for a
+// problem that does not need it taken down.
+//
+// The empty key id is what keeps it harmless. refresh records a miss only for a
+// genuine ask, so warming cannot arm the cooldown against the token that follows.
+func (c *Cache) Warm(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	now := c.clock()
+
+	c.mu.RLock()
+	fresh := !c.fetchedAt.IsZero() && now.Sub(c.fetchedAt) < c.interval
+	c.mu.RUnlock()
+	if fresh {
+		// Already holding a document young enough to be trusted. Re-reading it
+		// would spend a fetch to learn nothing.
+		return nil
+	}
+	_, err := c.refreshCtx(ctx, now, "")
+	return err
+}
+
 // refresh fetches the document once, however many callers want it.
 // refresh fetches the document, coalesced, and records whether the key the
 // caller asked for was in it. That last part is what arms the cooldown, and it is
 // why refresh is told which key it is being asked about rather than just
 // re-reading the document.
 func (c *Cache) refresh(now time.Time, askedFor string) (map[string]*rsa.PublicKey, error) {
+	// Resolution happens inside an HTTP handler with the caller's request behind
+	// it, so it carries no request context of its own: the per-fetch timeout is
+	// the whole bound. Warm, which has no request, supplies its own.
+	return c.refreshCtx(context.Background(), now, askedFor)
+}
+
+// refreshCtx is refresh with a caller-supplied context, so a warm can be cut
+// short when the service is shutting down rather than holding the exit open for
+// the rest of the fetch timeout.
+func (c *Cache) refreshCtx(ctx context.Context, now time.Time, askedFor string) (map[string]*rsa.PublicKey, error) {
 	c.mu.Lock()
 	if c.inflight != nil {
 		waiter := c.inflight
@@ -232,10 +279,10 @@ func (c *Cache) refresh(now time.Time, askedFor string) (map[string]*rsa.PublicK
 		close(f.done)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	fetchCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	raw, err := c.fetch(ctx)
+	raw, err := c.fetch(fetchCtx)
 	if err != nil {
 		f.err = fmt.Errorf("jwks: fetching %s: %w", c.jwksURL, err)
 		return nil, f.err
@@ -249,8 +296,15 @@ func (c *Cache) refresh(now time.Time, askedFor string) (map[string]*rsa.PublicK
 	c.mu.Lock()
 	c.keys = keys
 	c.fetchedAt = now
-	if _, present := keys[askedFor]; !present {
-		c.lastMiss = now
+	// Only a genuine ask may arm the cooldown. A warm asks for nothing: it has no
+	// key id to look for yet because no token has arrived to carry one. Recording
+	// a miss for it would refuse the first real key id for the whole cooldown
+	// window, which is this cache's lockout failure reached from the other
+	// direction — not too few fetches, but a refusal that outlives the reason.
+	if askedFor != "" {
+		if _, present := keys[askedFor]; !present {
+			c.lastMiss = now
+		}
 	}
 	c.mu.Unlock()
 

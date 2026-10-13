@@ -358,6 +358,108 @@ func TestKeyIDsListsOnlyUsableKeys(t *testing.T) {
 	}
 }
 
+// A warm must not look like a miss. It asks for no key id, so it must not arm the
+// cooldown: if it did, the token arriving just after the warm would be refused
+// for the whole window even though the document it needs had only just been read.
+// That is the cache's lockout failure reached from the opposite direction — not
+// too few fetches, but a refusal that outlives its reason.
+func TestAWarmDoesNotArmTheMissCooldown(t *testing.T) {
+	a := newIssuer(t, "kid-a")
+	now := time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)
+	fetch, calls := countingFetcher(t, func() []byte {
+		return document(t, a.entry())
+	})
+	c := newTestCache(t, fetch, &now, time.Hour)
+
+	if err := c.Warm(context.Background()); err != nil {
+		t.Fatalf("warming a reachable issuer: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("a warm fetched %d times, want 1", *calls)
+	}
+
+	// The warm loaded the document, so a token signed by that key needs nothing.
+	if _, err := c.ResolveKey("kid-a"); err != nil {
+		t.Fatalf("a token signed by the warmed key should resolve: %v", err)
+	}
+	if *calls != 1 {
+		t.Errorf("fetched %d times after a warm, want 1: the document is held", *calls)
+	}
+
+	// A key id the document does not publish must still be allowed to cause a
+	// fetch. Refusing it here would mean the warm had armed the cooldown against
+	// the first genuine token.
+	if _, err := c.ResolveKey("kid-not-published"); err == nil {
+		t.Fatal("resolved a key the document does not publish")
+	}
+	if *calls != 2 {
+		t.Errorf("fetched %d times for an unknown key id after a warm, want 2: "+
+			"the warm armed the miss cooldown against a real token", *calls)
+	}
+}
+
+// A warm that cannot reach the issuer must change nothing beyond timing. The
+// lazy fetch behind the first real key id still happens, and still succeeds.
+func TestAWarmFailureLeavesLazyFetchingIntact(t *testing.T) {
+	a := newIssuer(t, "kid-a")
+	now := time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)
+	up := false
+	fetch, calls := countingFetcher(t, func() []byte {
+		if !up {
+			return nil
+		}
+		return document(t, a.entry())
+	})
+	c := newTestCache(t, fetch, &now, time.Hour)
+
+	if err := c.Warm(context.Background()); err == nil {
+		t.Fatal("a warm against an unreachable issuer reported success")
+	}
+	if *calls != 1 {
+		t.Errorf("a failed warm attempted %d fetches, want 1", *calls)
+	}
+
+	// The issuer comes up and a token arrives.
+	up = true
+	if _, err := c.ResolveKey("kid-a"); err != nil {
+		t.Fatalf("a token arriving after a failed warm did not resolve: %v", err)
+	}
+	if *calls != 2 {
+		t.Errorf("fetched %d times, want 2: the warm's attempt plus the lazy one", *calls)
+	}
+}
+
+// A warm is one fetch while the document is young, not one per call. A retry loop
+// that re-read a document the cache already trusts would be a read amplifier of
+// its own, aimed at the issuer during the window when it is least able to answer.
+func TestAWarmIsNotRepeatedWhileTheDocumentIsFresh(t *testing.T) {
+	a := newIssuer(t, "kid-a")
+	now := time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)
+	fetch, calls := countingFetcher(t, func() []byte {
+		return document(t, a.entry())
+	})
+	c := newTestCache(t, fetch, &now, time.Hour)
+
+	if err := c.Warm(context.Background()); err != nil {
+		t.Fatalf("warming a reachable issuer: %v", err)
+	}
+	now = now.Add(59 * time.Minute)
+	if err := c.Warm(context.Background()); err != nil {
+		t.Fatalf("a second warm within the refresh interval: %v", err)
+	}
+	if *calls != 1 {
+		t.Errorf("warmed %d times within the refresh interval, want 1", *calls)
+	}
+
+	now = now.Add(2 * time.Minute)
+	if err := c.Warm(context.Background()); err != nil {
+		t.Fatalf("a warm past the refresh interval: %v", err)
+	}
+	if *calls != 2 {
+		t.Errorf("warmed %d times past the refresh interval, want 2", *calls)
+	}
+}
+
 // The cache has to satisfy the validator's interface, which is the whole reason
 // it exists in this shape.
 // Asserted against the real interface rather than a copy of it, so a change to

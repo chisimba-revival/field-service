@@ -18,10 +18,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,11 +45,29 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		healthcheck()
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("field-service stopped", "error", err)
 		os.Exit(1)
 	}
 }
+
+// defaultPrewarmWindow is how long the process keeps trying to load the JWKS
+// document in the background before giving up quietly.
+//
+// It has to outlast a slow Chisimba start, because that is the case it is for:
+// the issuer is a separate compose project and no depends_on can order it. Past
+// the window the warm stops and the first real key id pays for the fetch, which
+// is the behaviour the service had before this existed and is not a failure.
+const defaultPrewarmWindow = 60 * time.Second
+
+// prewarmBackoff is the pause between background JWKS attempts. Fixed rather
+// than configured because there is nothing to tune: the loop is bounded by the
+// window, and an operator who wants fewer attempts wants a shorter window.
+const prewarmBackoff = 2 * time.Second
 
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -83,7 +103,9 @@ func run() error {
 		return err
 	}
 
-	cache := jwks.New(cfg.jwksURL, jwks.WithInterval(cfg.jwksRefresh))
+	cache := jwks.New(cfg.jwksURL,
+		jwks.WithInterval(cfg.jwksRefresh),
+		jwks.WithTimeout(cfg.jwksTimeout))
 	validator, err := authn.NewValidator(cache, cfg.audience, cfg.issuer)
 	if err != nil {
 		return err
@@ -119,19 +141,27 @@ func run() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/v1/sync/", httpapi.NewSyncRoutes(guard, sync))
+	// Sync is reached by both doors: a device presents the person's own token
+	// and Chisimba's module presents a service token, so the route dispatches on
+	// the token's type rather than being wired to a single door.
+	mux.Handle("/api/v1/sync/", httpapi.NewSyncDispatchRoutes(guard, sync, cfg.scope))
 	// Sign-offs are written through the ordinary person door, which does set
 	// grants, so the write context is the caller's active context, read from the
 	// authenticated Caller by the handler — the same rule that governs a sighting.
 	// The service door is reserved for verification and is refused here by
 	// construction, not by a rule someone has to remember.
+	signoffSvc := signoff.New(
+		signoff.NewPgxStore(pool),
+		signoff.NewPgCatalogue(pool),
+		signoff.NewPgOutings(pool).InContext,
+	)
+	// The programme administrator's group, so the sign-off read rule can widen
+	// to an administrator in the same context. Left unset it widens to nobody,
+	// which is the safe default but not the intended one.
+	signoffSvc.AdminRole = "Admin"
 	signoffs := &httpapi.Signoffs{
-		Signoffs: signoff.New(
-			signoff.NewPgxStore(pool),
-			signoff.NewPgCatalogue(pool),
-			signoff.NewPgOutings(pool).InContext,
-		),
-		Log: logAdapter{log},
+		Signoffs: signoffSvc,
+		Log:      logAdapter{log},
 	}
 
 	// Sign-off routes use Go 1.22+ method-based routing (POST /api/v1/signoffs,
@@ -175,7 +205,13 @@ func run() error {
 		Verify: verify.New(verify.NewPgxStore(pool)),
 		Log:    logAdapter{log},
 	}
-	mux.Handle("/api/v1/log-book/verify", httpapi.NewVerificationRoutes(guard, verifier))
+	// Verification is a mentor/administrator action, so it requires the
+	// field:verify scope rather than the field:write every other person route
+	// carries.
+	verifyGuard := httpapi.NewGuard(
+		wiring.NewVerifier(validator), deny, session, logAdapter{log}, "field:verify",
+	)
+	mux.Handle("/api/v1/log-book/verify", httpapi.NewVerificationRoutes(verifyGuard, verifier))
 	// Health is the one route outside the guard, deliberately: a liveness probe
 	// cannot present a token, and a probe that needs credentials is a probe that
 	// fails when the thing it is probing is broken.
@@ -222,6 +258,17 @@ func run() error {
 		}
 	}()
 
+	// Pre-warming the JWKS document is background work, and deliberately cannot
+	// hold start-up up: the issuer is a separate deployment nobody can order into
+	// being up first, so making it a requirement would turn "Chisimba is still
+	// booting" into "field-service will not start". It retries quietly and, if it
+	// never succeeds, the first real key id pays for the fetch instead — which is
+	// exactly what happened before this existed. It also never gates /health,
+	// which is a liveness probe about this process alone.
+	if cfg.jwksPrewarm > 0 {
+		go warmJWKS(ctx, cache, cfg, log)
+	}
+
 	select {
 	case err := <-errs:
 		return err
@@ -237,6 +284,49 @@ func run() error {
 	return srv.Shutdown(shutdownCtx)
 }
 
+// warmJWKS loads the JWKS document in the background for a bounded while.
+//
+// The whole shape of this function is dictated by one fact: the issuer is in a
+// different deployment, so nothing this process does can guarantee it is serving
+// yet. Retrying quietly for a bounded window and then getting out of the way is
+// therefore the correct amount of effort — enough to cover a slow Chisimba start,
+// and no more, because ResolveKey already covers the case where it never happens.
+func warmJWKS(ctx context.Context, c *jwks.Cache, cfg config, log *slog.Logger) {
+	deadline := time.Now().Add(cfg.jwksPrewarm)
+	for {
+		err := c.Warm(ctx)
+		if err == nil {
+			log.Info("jwks pre-warmed", "url", cfg.jwksURL)
+			return
+		}
+		// Shutting down: a warm that survives its process would hold the exit open
+		// for the rest of the fetch timeout to learn nothing.
+		if ctx.Err() != nil {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			// Deliberately a Warn and not an error, and deliberately not fatal.
+			// Getting here means "the first token will fetch it instead", which is
+			// the behaviour this service had before pre-warming existed.
+			log.Warn("jwks pre-warm did not succeed; the first token will fetch it",
+				"url", cfg.jwksURL, "tried_for", cfg.jwksPrewarm, "error", err)
+			return
+		}
+		log.Debug("jwks pre-warm failed, retrying", "error", err)
+		if remaining > prewarmBackoff {
+			remaining = prewarmBackoff
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 // config is the service's whole configuration surface.
 type config struct {
 	listen          string
@@ -247,6 +337,8 @@ type config struct {
 	audience        string
 	scope           string
 	jwksRefresh     time.Duration
+	jwksTimeout     time.Duration
+	jwksPrewarm     time.Duration
 	mediaBackend    string
 	mediaGatewayURL string
 	mediaBucket     string
@@ -270,6 +362,8 @@ func configFromEnv() (config, error) {
 		audience:        os.Getenv("FIELDSVC_AUDIENCE"),
 		scope:           env("FIELDSVC_REQUIRED_SCOPE", "field:write"),
 		jwksRefresh:     15 * time.Minute,
+		jwksTimeout:     jwks.DefaultTimeout,
+		jwksPrewarm:     defaultPrewarmWindow,
 		mediaBackend:    env("FIELDSVC_MEDIA_BACKEND", "chisimba"),
 		mediaGatewayURL: env("FIELDSVC_MEDIA_GATEWAY_URL", "http://web/api/v1"),
 		mediaBucket:     env("FIELDSVC_MEDIA_BUCKET", ""),
@@ -292,6 +386,27 @@ func configFromEnv() (config, error) {
 		}
 		c.jwksRefresh = d
 	}
+	// Bounds one attempt to read the issuer's document, whether that attempt is a
+	// warm at start-up or a refresh behind a token. The document is small and this
+	// service is offline-first, so a slow read is a fault rather than a condition
+	// to wait out.
+	if raw := os.Getenv("FIELDSVC_JWKS_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("FIELDSVC_JWKS_TIMEOUT: %w", err)
+		}
+		c.jwksTimeout = d
+	}
+	// How long to keep pre-warming before falling back to lazy fetching. Zero or
+	// negative disables it, which is a legitimate choice for a deployment that
+	// would rather not talk to the issuer until a token forces it.
+	if raw := os.Getenv("FIELDSVC_JWKS_PREWARM"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("FIELDSVC_JWKS_PREWARM: %w", err)
+		}
+		c.jwksPrewarm = d
+	}
 	return c, nil
 }
 
@@ -300,6 +415,41 @@ func env(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// healthcheck is how this image answers "is the process serving".
+//
+// A container HEALTHCHECK cannot ask the question itself: the runtime image is
+// distroless, which carries no shell and no curl, so there is no command that
+// could probe the listener. The binary answers it instead, calling its own
+// /health route over loopback. That route sits outside the auth guard
+// deliberately — a probe that must present a token is a probe that fails when
+// the service is healthy.
+//
+// This is a liveness probe, not a readiness probe. It reports only that the
+// listener accepts connections, and deliberately says nothing about Postgres,
+// Redis or Chisimba, each of which can be unreachable while the process is
+// still worth keeping alive. Claiming readiness on their behalf would be a
+// judgement this process has no basis to make, and would take the container
+// down for a problem that does not need it taken down.
+func healthcheck() {
+	listen := env("FIELDSVC_LISTEN", ":8080")
+	if strings.HasPrefix(listen, ":") {
+		// A bare port binds every interface; a probe belongs on loopback.
+		listen = "127.0.0.1" + listen
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + listen + "/health")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: /health returned %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // logAdapter sends the guard's refusals to slog.

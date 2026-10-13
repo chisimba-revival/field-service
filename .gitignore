@@ -14,3 +14,9 @@
 /bin/
 /field-service-new
 /field-service-updated
+/verify2
+
+# Local development configuration for the stack. Every value in it has a
+# fallback in docker-compose.yml, so a clone without it still starts.
+/.env
+

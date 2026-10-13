@@ -129,6 +129,10 @@ func (t *pgxTx) Apply(ctx context.Context, caller Caller, op Operation) (Result,
 			res, err = t.createEncounter(ctx, caller, op)
 		case entityTrailWaypoint:
 			res, err = t.createTrailWaypoint(ctx, caller, op)
+		case entityPlannedRoute:
+			res, err = t.createPlannedRoute(ctx, caller, op)
+		case entityRouteWaypoint:
+			res, err = t.createRouteWaypoint(ctx, caller, op)
 		default:
 			res = Result{
 				OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
@@ -141,12 +145,40 @@ func (t *pgxTx) Apply(ctx context.Context, caller Caller, op Operation) (Result,
 		}
 	case "correct":
 		res, err = t.correct(ctx, caller, op)
+	case "verify":
+		res, err = t.verify(ctx, caller, op)
 	case "update":
-		// An outing starts as a create, and its end — duration, hours by day and
-		// night, the off-road rollup — arrives later as an update against the
-		// revision the create returned. Nothing else is updatable: a waypoint is
-		// append-only by contract, and a sighting is corrected, never replaced.
-		res, err = t.updateOuting(ctx, caller, op)
+		switch op.Entity {
+		case "outing":
+			res, err = t.updateOuting(ctx, caller, op)
+		case entityPlannedRoute:
+			res, err = t.updatePlannedRoute(ctx, caller, op)
+		case entityRouteWaypoint:
+			res, err = t.updateRouteWaypoint(ctx, caller, op)
+		default:
+			res = Result{
+				OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+				Outcome: OutcomeRefused, ErrorCode: "unsupported_entity_for_update",
+				ClientState: map[string]any{
+					"expected": []string{"outing", entityPlannedRoute, entityRouteWaypoint},
+				},
+			}
+		}
+	case "delete":
+		switch op.Entity {
+		case entityPlannedRoute:
+			res, err = t.deletePlannedRoute(ctx, caller, op)
+		case entityRouteWaypoint:
+			res, err = t.deleteRouteWaypoint(ctx, caller, op)
+		default:
+			res = Result{
+				OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+				Outcome: OutcomeRefused, ErrorCode: "unsupported_entity_for_delete",
+				ClientState: map[string]any{
+					"expected": []string{entityPlannedRoute, entityRouteWaypoint},
+				},
+			}
+		}
 	default:
 		// Refused rather than deferred: a kind this build does not know will not
 		// become known by waiting, and deferring would keep the client retrying
@@ -369,6 +401,39 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 	newSpecies := payloadTextPtr(op.Payload, "species_code")
 	newCount := payloadIntPtr(op.Payload, "count")
 	reason := payloadTextPtr(op.Payload, "correction_reason")
+	// An amendment is not a field of this store's own invention: the client
+	// sends the same keys create() reads, so that the operation which corrects a
+	// record and the operation which wrote it speak one vocabulary. Before this
+	// was read, a note-only amendment arrived carrying none of the keys above,
+	// every coalesce below resolved to null, and the answer the client received
+	// was OutcomeApplied — the record was acknowledged as changed and nothing
+	// about it had changed. The reason was, in fact, cleared.
+	newBehaviour := payloadTextPtr(op.Payload, "behaviour")
+	newAgeSexClass := payloadTextPtr(op.Payload, "age_sex_class")
+	newNotes := payloadTextPtr(op.Payload, "notes")
+	for _, e := range []struct {
+		key string
+		val *string
+	}{
+		{"behaviour", newBehaviour},
+		{"age_sex_class", newAgeSexClass},
+	} {
+		if e.val == nil {
+			continue
+		}
+		known, err := t.enumValue(ctx, e.key, *e.val)
+		if err != nil {
+			return Result{}, err
+		}
+		if !known {
+			return Result{
+				OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+				Outcome: OutcomeRefused, ErrorCode: "unknown_" + e.key,
+				ServerState: map[string]any{e.key: *e.val},
+				ClientState: op.Payload,
+			}, nil
+		}
+	}
 	// Counts are compared as ints. They arrive from the database as text because
 	// a nullable integer scanned through a driver that has to handle the null
 	// case is easier to read that way, and a lexical comparison would decide "10"
@@ -410,12 +475,31 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 		  revision          = revision + 1,
 		  -- the originals are written first and never cleared, so the record
 		  -- always shows both what was claimed and what it was corrected to
-		  recorded_species_code = coalesce(recorded_species_code, species_code),
-		  recorded_count       = coalesce(recorded_count, count),
-		  correction_reason    = $2,
+		  --
+		  -- Only a correction that actually moves the claim stamps it. Writing
+		  -- the present value as "what was claimed" when nothing was corrected
+		  -- asserts that the record was corrected when it was not, and leaves
+		  -- recorded_* set beside an empty correction_reason — which
+		  -- correction_has_reason refuses, so an amendment carrying nothing but
+		  -- a note would be a constraint violation rather than an amendment.
+		  recorded_species_code = case
+		    when $3::text is not null and $3::text is distinct from species_code
+		      then coalesce(recorded_species_code, species_code)
+		    else recorded_species_code end,
+		  recorded_count       = case
+		    when $4::int is not null and $4::int is distinct from count
+		      then coalesce(recorded_count, count)
+		    else recorded_count end,
+		  -- a reason is never cleared by a later amendment that carries none.
+		  -- Overwriting it would leave recorded_* set with no reason beside it,
+		  -- which is exactly what the check constraint forbids
+		  correction_reason    = coalesce($2, correction_reason),
 		  species_code         = coalesce($3, species_code),
 		  count                = coalesce($4, count),
 		  verification_notes   = coalesce($5, verification_notes),
+		  behaviour            = coalesce($7, behaviour),
+		  age_sex_class        = coalesce($8, age_sex_class),
+		  notes                = coalesce($9, notes),
 		  verified_by          = $6,
 		  verified_at          = now()
 		where id = $1
@@ -426,6 +510,7 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 		reason, newSpecies, newCount,
 		payloadTextPtr(op.Payload, "verification_notes"),
 		caller.ID,
+		newBehaviour, newAgeSexClass, newNotes,
 	).Scan(&revision)
 	if err != nil {
 		// A constraint violation reaching here means the check above and the
@@ -445,11 +530,154 @@ func (t *pgxTx) correct(ctx context.Context, caller Caller, op Operation) (Resul
 	}, nil
 }
 
-// feed appends the change-feed entry carrying the row itself.
+// verify applies a mentor's decision to a log book entry.
 //
-// The body is the serialised row rather than its identity: identity-only turns
-// one page into N round trips over a connection that is already marginal, which
-// is the situation this service exists for. A live join is worse — the page
+// It is the person-door equivalent of the service-door verify endpoint.
+// The trainee (or mentor on the device) submits a verification outcome
+// (verified/rejected/needs_review) with optional corrections to species/count
+// and the mentor's reasoning. The service requires a correction_reason when
+// species or count is changed. The base revision ensures the mentor read the
+// current state of the record.
+func (t *pgxTx) verify(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	if op.Entity != entityLogBookEntry {
+		return unsupported(op, entityLogBookEntry), nil
+	}
+	if op.BaseRevision == nil {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "verify_without_base_revision",
+			ClientState: op.Payload,
+		}, nil
+	}
+
+	// Validate outcome
+	outcomeStr := payloadText(op.Payload, "outcome")
+	if outcomeStr != "verified" && outcomeStr != "rejected" && outcomeStr != "needs_review" {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "unknown_outcome",
+			ClientState: op.Payload,
+		}, nil
+	}
+
+	// Mentor is the caller (person token)
+	if caller.ID == "" {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "verify_without_mentor",
+			ClientState: op.Payload,
+		}, nil
+	}
+
+	// Verify context - the entry must be in the caller's context
+	var currentRevision int64
+	var currentSpecies *string
+	var currentCount *int
+	var currentStatus string
+	err := t.tx.QueryRow(ctx,
+		`select revision, species_code, count, status::text
+		   from log_book_entry
+		  where id = $1 and context_code = $2 and deleted_at is null`,
+		op.EntityID, caller.WriteContext).
+		Scan(&currentRevision, &currentSpecies, &currentCount, &currentStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "unknown_log_book_entry",
+		}, nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	// Check base revision matches
+	if *op.BaseRevision != currentRevision {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "revision_conflict",
+			ServerRevision: currentRevision,
+			ClientState:    op.Payload,
+		}, nil
+	}
+
+	// Cannot re-verify an already decided entry
+	if currentStatus != "pending" && currentStatus != "needs_review" {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "already_decided",
+			ClientState: op.Payload,
+		}, nil
+	}
+
+	// Rule 15: correction requires reason
+	newSpecies := payloadTextPtr(op.Payload, "species_code")
+	newCount := payloadIntPtr(op.Payload, "count")
+	reason := payloadTextPtr(op.Payload, "correction_reason")
+	changesClaim := (newSpecies != nil && (currentSpecies == nil || *newSpecies != *currentSpecies)) ||
+		(newCount != nil && *newCount != derefOrInt(currentCount, -1))
+	if changesClaim && (reason == nil || *reason == "") {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "correction_requires_a_reason",
+			ServerState: map[string]any{
+				"species_code": derefOr(currentSpecies, ""),
+				"count":        derefOrInt(currentCount, -1),
+			},
+			ClientState: op.Payload,
+		}, nil
+	}
+
+	// Record what was claimed before correction
+	var recordedSpecies *string
+	var recordedCount *int
+	if newSpecies != nil || newCount != nil {
+		recordedSpecies = currentSpecies
+		recordedCount = currentCount
+	}
+
+	// Apply the verification
+	const q = `
+		update log_book_entry set
+		  revision          = revision + 1,
+		  status            = $3::sighting_status,
+		  verified_by       = $4,
+		  verified_at       = $5,
+		  verification_notes = nullif($6, ''),
+		  correction_reason = coalesce(nullif($7, ''), correction_reason),
+		  species_code      = $8,
+		  count             = $9,
+		  recorded_species_code = coalesce($10, recorded_species_code),
+		  recorded_count    = coalesce($11, recorded_count),
+		  revision          = $12
+		where id = $1 and context_code = $2
+		returning revision`
+
+	var revision int64
+	err = t.tx.QueryRow(ctx, q,
+		op.EntityID, caller.WriteContext,
+		payloadText(op.Payload, "outcome"),
+		caller.ID,
+		time.Now().UTC(),
+		payloadTextPtr(op.Payload, "verification_notes"),
+		payloadTextPtr(op.Payload, "correction_reason"),
+		newSpecies, newCount,
+		recordedSpecies, recordedCount,
+		currentRevision+1,
+	).Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+// feed appends the change-feed entry carrying the row itself.
 // stops being a consistent snapshot, and a client can receive two revisions of
 // one record in one page and apply them the wrong way round.
 func (t *pgxTx) feed(ctx context.Context, caller Caller, op Operation, revision int64) error {
@@ -488,6 +716,8 @@ var feedTables = map[string]string{
 	"outing":                     "outing",
 	entityDangerousGameEncounter: entityDangerousGameEncounter,
 	entityTrailWaypoint:          "trail_waypoint",
+	entityPlannedRoute:           "planned_routes",
+	entityRouteWaypoint:          "route_waypoints",
 }
 
 func unsupported(op Operation, want string) Result {
@@ -515,6 +745,13 @@ func derefOr(s *string, fallback string) string {
 	return *s
 }
 
+func derefOrInt(i *int, fallback int) int {
+	if i == nil {
+		return fallback
+	}
+	return *i
+}
+
 // Payload readers. Each returns nil for an absent key so that "not mentioned"
 // and "mentioned as empty" stay distinguishable — a sparse correction must not
 // blank a field the client never sent.
@@ -540,6 +777,27 @@ func payloadIntPtr(m map[string]any, k string) *int {
 		return &v
 	}
 	return nil
+}
+
+// enumValue reports whether v is a member of typeName.
+//
+// The check is here because an enum column reached with a value the type does
+// not have returns an error, and an error from correct() fails the entire batch
+// — every other operation in it, belonging to other people, is lost with it. A
+// client that is a version behind and sends a behaviour this database does not
+// have yet has made a mistake, not proven this service broken, so it gets a
+// refusal scoped to its own operation. typeName is never client input: the only
+// two call sites pass literals in this file.
+func (t *pgxTx) enumValue(ctx context.Context, typeName, v string) (bool, error) {
+	var ok bool
+	err := t.tx.QueryRow(ctx,
+		`select exists (select 1 from unnest(enum_range(null::`+typeName+`)) e where e::text = $1)`,
+		v,
+	).Scan(&ok)
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
 }
 
 // payloadInt handles both numeric kinds a payload can carry.
@@ -623,4 +881,487 @@ func payloadUUID(m map[string]any, k string) string {
 		return s
 	}
 	return ""
+}
+
+// updatePlannedRoute updates a planned route's outing_id or timestamps.
+//
+// A planned route is created with an outing_id and can be updated to change
+// its outing association or just touch its updated_at timestamp. The base
+// revision ensures optimistic concurrency.
+func (t *pgxTx) updatePlannedRoute(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	if !isUUID(op.EntityID) {
+		return refuse(op, "update_without_entity_id"), nil
+	}
+	if op.BaseRevision == nil {
+		return refuse(op, "update_without_base_revision"), nil
+	}
+
+	var serverRevision int64
+	var serverOutingID string
+	err := t.tx.QueryRow(ctx,
+		`select revision, outing_id from planned_routes where id = $1 and context_code = $2`,
+		op.EntityID, caller.WriteContext).
+		Scan(&serverRevision, &serverOutingID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "update_unknown_planned_route"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	if serverRevision != *op.BaseRevision {
+		var existing map[string]any
+		_ = json.Unmarshal([]byte("{}"), &existing) // no serverState in query above
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "revision_conflict",
+			ServerRevision: serverRevision, ServerState: existing,
+			ClientState: op.Payload,
+		}, nil
+	}
+
+	// Optional: update outing_id if provided
+	newOutingID := payloadUUID(op.Payload, "outing_id")
+	if isUUID(newOutingID) {
+		known, err := t.outingInContext(ctx, newOutingID, caller.WriteContext)
+		if err != nil {
+			return Result{}, err
+		}
+		if !known {
+			return refuse(op, "unknown_outing"), nil
+		}
+	}
+
+	const q = `
+		update planned_routes set
+		  revision    = revision + 1,
+		  outing_id   = coalesce($2::uuid, outing_id),
+		  updated_at  = now()
+		where id = $1 and context_code = $3
+		returning revision`
+
+	var revision int64
+	err = t.tx.QueryRow(ctx, q,
+		op.EntityID,
+		payloadUUID(op.Payload, "outing_id"),
+		caller.WriteContext,
+	).Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+// updateRouteWaypoint updates a waypoint's position or metadata.
+//
+// Waypoints are append-only by contract (no delete path in the client), but
+// the server supports sparse updates to position, label, kind, or note.
+// The base revision ensures optimistic concurrency.
+func (t *pgxTx) updateRouteWaypoint(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	parts := splitEntityID(op.EntityID)
+	if len(parts) != 2 {
+		return refuse(op, "route_waypoint_invalid_entity_id"), nil
+	}
+	routeID := parts[0]
+	ordinal, err := strconv.Atoi(parts[1])
+	if err != nil || ordinal < 0 {
+		return refuse(op, "route_waypoint_invalid_ordinal"), nil
+	}
+
+	if op.BaseRevision == nil {
+		return refuse(op, "update_without_base_revision"), nil
+	}
+
+	// Verify route exists and caller has access
+	var routeOutingID string
+	err = t.tx.QueryRow(ctx,
+		`select outing_id from planned_routes where id = $1 and context_code = $2`,
+		routeID, caller.WriteContext).
+		Scan(&routeOutingID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "unknown_route"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	known, err := t.outingInContext(ctx, routeOutingID, caller.WriteContext)
+	if err != nil {
+		return Result{}, err
+	}
+	if !known {
+		return refuse(op, "unknown_outing"), nil
+	}
+
+	var serverRevision int64
+	err = t.tx.QueryRow(ctx,
+		`select revision from route_waypoints where route_id = $1 and ordinal = $2`,
+		routeID, ordinal).
+		Scan(&serverRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "update_unknown_route_waypoint"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	if serverRevision != *op.BaseRevision {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "revision_conflict",
+			ServerRevision: serverRevision,
+			ClientState:    op.Payload,
+		}, nil
+	}
+
+	// Sparse update of waypoint fields
+	const q = `
+		update route_waypoints set
+		  revision = revision + 1,
+		  latitude  = coalesce($3, latitude),
+		  longitude = coalesce($4, longitude),
+		  label     = coalesce($5, label),
+		  kind      = coalesce($6, kind),
+		  note      = coalesce($7, note)
+		where route_id = $1 and ordinal = $2
+		returning revision`
+
+	var revision int64
+	err = t.tx.QueryRow(ctx, q,
+		routeID, ordinal,
+		payloadFloatPtr(op.Payload, "latitude"),
+		payloadFloatPtr(op.Payload, "longitude"),
+		payloadTextPtr(op.Payload, "label"),
+		payloadTextPtr(op.Payload, "kind"),
+		payloadTextPtr(op.Payload, "note"),
+	).Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+// deletePlannedRoute tombstones a planned route and its waypoints.
+//
+// A deletion is a soft delete (is_tombstone = true) so the record remains
+// in the change feed and the client can reconcile. The base revision
+// ensures optimistic concurrency.
+func (t *pgxTx) deletePlannedRoute(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	if !isUUID(op.EntityID) {
+		return refuse(op, "delete_without_entity_id"), nil
+	}
+	if op.BaseRevision == nil {
+		return refuse(op, "delete_without_base_revision"), nil
+	}
+
+	var serverRevision int64
+	err := t.tx.QueryRow(ctx,
+		`select revision from planned_routes where id = $1 and context_code = $2`,
+		op.EntityID, caller.WriteContext).
+		Scan(&serverRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "delete_unknown_planned_route"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	if serverRevision != *op.BaseRevision {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "revision_conflict",
+			ServerRevision: serverRevision,
+			ClientState:    op.Payload,
+		}, nil
+	}
+
+	// Soft delete: tombstone the route and cascade to waypoints
+	_, err = t.tx.Exec(ctx,
+		`update planned_routes set
+		  is_tombstone = true,
+		  deleted_at = now(),
+		  revision = revision + 1,
+		  updated_at = now()
+		where id = $1 and context_code = $2`,
+		op.EntityID, caller.WriteContext)
+	if err != nil {
+		return Result{}, err
+	}
+
+	// Tombstone waypoints
+	_, err = t.tx.Exec(ctx,
+		`update route_waypoints set
+		  is_tombstone = true,
+		  deleted_at = now(),
+		  revision = revision + 1
+		where route_id = $1`,
+		op.EntityID)
+	if err != nil {
+		return Result{}, err
+	}
+
+	// Get the new revision for the feed
+	var revision int64
+	err = t.tx.QueryRow(ctx,
+		`select revision from planned_routes where id = $1`, op.EntityID).
+		Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+// deleteRouteWaypoint tombstones a single waypoint.
+//
+// The base revision ensures optimistic concurrency. The route is verified
+// to exist and be in the caller's context.
+func (t *pgxTx) deleteRouteWaypoint(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	parts := splitEntityID(op.EntityID)
+	if len(parts) != 2 {
+		return refuse(op, "route_waypoint_invalid_entity_id"), nil
+	}
+	routeID := parts[0]
+	ordinal, err := strconv.Atoi(parts[1])
+	if err != nil || ordinal < 0 {
+		return refuse(op, "route_waypoint_invalid_ordinal"), nil
+	}
+
+	if op.BaseRevision == nil {
+		return refuse(op, "delete_without_base_revision"), nil
+	}
+
+	// Verify route exists and caller has access
+	var routeOutingID string
+	err = t.tx.QueryRow(ctx,
+		`select outing_id from planned_routes where id = $1 and context_code = $2`,
+		routeID, caller.WriteContext).
+		Scan(&routeOutingID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "unknown_route"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	known, err := t.outingInContext(ctx, routeOutingID, caller.WriteContext)
+	if err != nil {
+		return Result{}, err
+	}
+	if !known {
+		return refuse(op, "unknown_outing"), nil
+	}
+
+	var serverRevision int64
+	err = t.tx.QueryRow(ctx,
+		`select revision from route_waypoints where route_id = $1 and ordinal = $2`,
+		parts[0], parts[1]).
+		Scan(&serverRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "delete_unknown_route_waypoint"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	if serverRevision != *op.BaseRevision {
+		return Result{
+			OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+			Outcome: OutcomeRefused, ErrorCode: "revision_conflict",
+			ServerRevision: serverRevision,
+			ClientState:    op.Payload,
+		}, nil
+	}
+
+	// Soft delete the waypoint
+	_, err = t.tx.Exec(ctx,
+		`update route_waypoints set
+		  is_tombstone = true,
+		  deleted_at = now(),
+		  revision = revision + 1
+		where route_id = $1 and ordinal = $2`,
+		parts[0], parts[1])
+	if err != nil {
+		return Result{}, err
+	}
+
+	var revision int64
+	err = t.tx.QueryRow(ctx,
+		`select revision from route_waypoints where route_id = $1 and ordinal = $2`,
+		parts[0], parts[1]).
+		Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+// createPlannedRoute creates a new planned route for an outing.
+//
+// A planned route records where the guide intends to go. It is owned by an
+// outing and carries waypoints that define the route geometry. The contract
+// is local-first: the device plans the route, and the server may or may not
+// ever receive it.
+func (t *pgxTx) createPlannedRoute(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	if !isUUID(op.EntityID) {
+		return refuse(op, "planned_route_without_entity_id"), nil
+	}
+	if op.BaseRevision != nil {
+		return refuse(op, "create_with_base_revision"), nil
+	}
+
+	outingID := payloadUUID(op.Payload, "outing_id")
+	if !isUUID(outingID) {
+		return refuse(op, "planned_route_without_outing"), nil
+	}
+	known, err := t.outingInContext(ctx, outingID, caller.WriteContext)
+	if err != nil {
+		return Result{}, err
+	}
+	if !known {
+		return refuse(op, "unknown_outing"), nil
+	}
+
+	const q = `
+		insert into planned_routes
+		  (id, context_code, outing_id, created_at, updated_at, revision)
+		values ($1,$2,$3,now(),now(),1)
+		on conflict (id) do nothing
+		returning revision`
+	var revision int64
+	err = t.tx.QueryRow(ctx, q,
+		op.EntityID, caller.WriteContext, outingID,
+	).Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+	if revision == 0 {
+		// Row already existed (conflict on id)
+		return refuse(op, "already_exists"), nil
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+func (t *pgxTx) createRouteWaypoint(ctx context.Context, caller Caller, op Operation) (Result, error) {
+	if !isUUID(op.EntityID) {
+		return refuse(op, "route_waypoint_without_entity_id"), nil
+	}
+	if op.BaseRevision != nil {
+		return refuse(op, "create_with_base_revision"), nil
+	}
+
+	// entityID format: "route_id:ordinal"
+	parts := splitEntityID(op.EntityID)
+	if len(parts) != 2 {
+		return refuse(op, "route_waypoint_invalid_entity_id"), nil
+	}
+	routeID := parts[0]
+	ordinal, err := strconv.Atoi(parts[1])
+	if err != nil || ordinal < 0 {
+		return refuse(op, "route_waypoint_invalid_ordinal"), nil
+	}
+
+	// Verify route exists and caller has access
+	var routeOutingID string
+	err = t.tx.QueryRow(ctx,
+		`select outing_id from planned_routes where id = $1`, routeID,
+	).Scan(&routeOutingID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return refuse(op, "unknown_route"), nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+
+	known, err := t.outingInContext(ctx, routeOutingID, caller.WriteContext)
+	if err != nil {
+		return Result{}, err
+	}
+	if !known {
+		return refuse(op, "unknown_outing"), nil
+	}
+
+	longitude := payloadFloatPtr(op.Payload, "longitude")
+	latitude := payloadFloatPtr(op.Payload, "latitude")
+	if longitude == nil || latitude == nil {
+		return refuse(op, "route_waypoint_without_location"), nil
+	}
+
+	ordinalVal, ok := payloadInt(op.Payload, "ordinal").(int)
+	if !ok || ordinalVal < 0 {
+		return refuse(op, "route_waypoint_without_ordinal"), nil
+	}
+
+	const q = `
+		insert into route_waypoints
+		  (route_id, ordinal, latitude, longitude, label, kind, note, revision)
+		values ($1,$2,$3,$4,$5,$6,$7,1)
+		on conflict (route_id, ordinal) do nothing
+		returning revision`
+	var revision int64
+	err = t.tx.QueryRow(ctx, q,
+		op.EntityID, ordinal, // route_id, ordinal
+		payloadFloat(op.Payload, "longitude"), payloadFloat(op.Payload, "latitude"),
+		payloadTextPtr(op.Payload, "label"),
+		payloadTextPtr(op.Payload, "kind"),
+		payloadTextPtr(op.Payload, "note"),
+	).Scan(&revision)
+	if err != nil {
+		return Result{}, err
+	}
+	if revision == 0 {
+		return refuse(op, "already_exists"), nil
+	}
+
+	if err := t.feed(ctx, caller, op, revision); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		OperationID: op.OperationID, Entity: op.Entity, EntityID: op.EntityID,
+		Outcome: OutcomeApplied, NewRevision: revision,
+	}, nil
+}
+
+// splitEntityID splits "route_id:ordinal" into [route_id, ordinal]
+func splitEntityID(id string) []string {
+	for i := len(id) - 1; i >= 0; i-- {
+		if id[i] == ':' {
+			return []string{id[:i], id[i+1:]}
+		}
+	}
+	return []string{id, "0"}
 }

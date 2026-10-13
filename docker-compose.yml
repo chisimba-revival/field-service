@@ -5,36 +5,50 @@
 # and then could not rebuild. The schema itself is not here: it is applied by
 # migrations, so that the order they run in is recorded in the repository.
 #
-# Ports are published directly rather than reached through a tunnel container.
-# A tunnel is only necessary when the database container does not publish a
-# port, and it adds a process whose failure looks like the database failing.
+# Containment: field-service is a backend. It has no host-facing port at all.
+# It is reached by Chisimba over the api_integration network and by field
+# devices through the Chisimba TLS gateway, which is the only thing published.
+# That is why the services here are not reachable from outside the machine
+# rather than merely bound to an unusual port.
 #
-# These ports are deliberately not the defaults. 5432 and 6379 collide with
-# whatever else is running on the machine, and the failure mode of that
-# collision is another project's service failing in a confusing way.
+# These two ports are published on loopback only, for a developer with a psql
+# client. They are deliberately not 0.0.0.0: the stack is meant to be reachable
+# from this machine and from nowhere else. Comment them out if even that is not
+# wanted.
 
 services:
   postgres:
     image: postgis/postgis:16-3.5
     environment:
-      POSTGRES_USER: fieldsvc
-      POSTGRES_PASSWORD: fieldsvc
-      POSTGRES_DB: fieldlog
+      POSTGRES_USER: ${FIELDSVC_DB_MIGRATE_USER:-fieldsvc}
+      POSTGRES_PASSWORD: ${FIELDSVC_DB_MIGRATE_PASSWORD:-fieldsvc}
+      POSTGRES_DB: ${FIELDSVC_DB_NAME:-fieldlog}
       # PostGIS refuses to initialise its extension scripts on a database whose
       # locale is not set, and the failure is a confusing one. Setting it here
       # means a fresh volume comes up with spatial support already present.
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
-      - "55433:5432"
+      - "127.0.0.1:55433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       # Refusing connections is not the same as being unable to answer them, so
       # this asks a question rather than testing the port.
-      test: ["CMD-SHELL", "pg_isready -U fieldsvc -d fieldlog"]
+      test: ["CMD-SHELL", "pg_isready -U ${FIELDSVC_DB_MIGRATE_USER:-fieldsvc} -d ${FIELDSVC_DB_NAME:-fieldlog}"]
       interval: 5s
       timeout: 3s
       retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -44,12 +58,34 @@ services:
     # thing that needs revisiting.
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "allkeys-lru"]
     ports:
-      - "56380:6379"
+      - "127.0.0.1:56380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+    # Chisimba reaches this Redis over api_integration to publish the revocation
+    # denylist (KEWL_DENYLIST_REDIS in Chisimba's config). The alias is the name
+    # Chisimba is configured with, pinned here so a compose project rename cannot
+    # quietly break revocation: an epoch published to a Redis nothing else reads
+    # is a revocation that has not happened, and sign-in would answer 500 rather
+    # than issue a token nobody would honour.
+    networks:
+      default:
+      api_integration:
+        aliases:
+          - field-service-redis-1
 
   # One-shot schema migration. It runs to completion before field-service
   # starts, so a fresh volume comes up with a schema rather than a connection
@@ -62,24 +98,46 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      PGPASSWORD: fieldsvc
+      PGPASSWORD: ${FIELDSVC_DB_MIGRATE_PASSWORD:-fieldsvc}
     volumes:
       - ./migrations:/migrations:ro
       - ./scripts:/scripts:ro
     entrypoint: ["sh", "/scripts/migrate.sh"]
-    command: ["postgres://fieldsvc:fieldsvc@postgres:5432/fieldlog?sslmode=disable"]
+    command:
+      - "postgres://${FIELDSVC_DB_MIGRATE_USER:-fieldsvc}:${FIELDSVC_DB_MIGRATE_PASSWORD:-fieldsvc}@postgres:5432/${FIELDSVC_DB_NAME:-fieldlog}?sslmode=disable"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: "no"
 
-  # The service itself. Its own PostGIS and Redis are reached over this
-  # project's default network; Chisimba's JWKS is reached over the external
-  # chisimba-dev network, where the web service is named `web`. It connects to
-  # Postgres as the fieldapp runtime role, never the migration superuser, so
-  # row-level security actually applies (see migrations/0002_runtime_role.sql).
+  # The service itself.
+  #
+  # Its own PostGIS and Redis are reached over this project's default network.
+  # Chisimba is reached over api_integration under the stable alias
+  # `chisimba-api`, which is a name that describes the integration contract
+  # rather than a container somebody happened to call `web` or a compose project
+  # that happens to be called chisimba-dev. It connects to Postgres as the
+  # fieldapp runtime role, never the migration superuser, so row-level security
+  # actually applies (see migrations/0002_runtime_role.sql).
+  #
+  # There is no `ports:` here on purpose. Publishing a host port would put the
+  # service on the machine's network surface, which is the opposite of the
+  # containment the rest of this file is arranged for. Field devices reach it
+  # through the Chisimba gateway, which already terminates TLS and already
+  # carries the tokens.
   field-service:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: field-service
+    env_file:
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,32 +146,55 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      FIELDSVC_DATABASE_URL: postgres://fieldapp:fieldsvc@postgres:5432/fieldlog?sslmode=disable
+      FIELDSVC_DATABASE_URL: postgres://${FIELDSVC_DB_APP_USER:-fieldapp}:${FIELDSVC_DB_APP_PASSWORD:-fieldsvc}@postgres:5432/${FIELDSVC_DB_NAME:-fieldlog}?sslmode=disable
       FIELDSVC_REDIS_ADDR: redis:6379
-      FIELDSVC_JWKS_URL: http://web/api/v1/auth/jwks
       # These must match the claims Chisimba signs. They are the values in
       # TokenAuthService ($issuer = 'chisimba', $audience = 'chisimba-api'),
       # not the stale examples in FIELD_SERVICE_INTEGRATION_FINAL.md. A
       # mismatch fails closed: every token is refused.
-      FIELDSVC_ISSUER: chisimba
-      FIELDSVC_AUDIENCE: chisimba-api
+      FIELDSVC_JWKS_URL: ${FIELDSVC_JWKS_URL:-http://chisimba-api/api/v1/auth/jwks}
+      FIELDSVC_ISSUER: ${FIELDSVC_ISSUER:-chisimba}
+      FIELDSVC_AUDIENCE: ${FIELDSVC_AUDIENCE:-chisimba-api}
       FIELDSVC_LISTEN: ":8080"
-      FIELDSVC_REQUIRED_SCOPE: field:write
-    ports:
-      - "8081:8080"
+      FIELDSVC_REQUIRED_SCOPE: ${FIELDSVC_REQUIRED_SCOPE:-field:write}
+      FIELDSVC_MEDIA_GATEWAY_URL: ${FIELDSVC_MEDIA_GATEWAY_URL:-http://chisimba-api/api/v1}
+    healthcheck:
+      # The binary carries a `healthcheck` subcommand because the distroless
+      # runtime has no shell and no curl, so nothing else can ask the question.
+      # It probes /health, which sits outside the auth guard by design.
+      test: ["CMD", "/field-service", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
     networks:
       - default
-      - chisimba
-    restart: unless-stopped
+      - api_integration
 
 volumes:
   pgdata:
 
 networks:
+  # This project's own network. Postgres, Redis and field-service live here.
   default:
-  # The network the Chisimba stack (project `chisimba-dev`) creates. Marked
-  # external because this compose file does not own it; it must already be
-  # running, which it is whenever `web` is up.
-  chisimba:
+  # The shared API integration network, created once and owned by nobody in
+  # particular:
+  #   docker network create chisimba-api-integration
+  # The Chisimba stack attaches its web service to it with the alias
+  # `chisimba-api`, and its TLS gateway attaches to proxy the mobile traffic.
+  # field-service joins only this, which is what keeps Chisimba's database off
+  # its network map: it cannot reach MariaDB any more, only the API.
+  api_integration:
     external: true
-    name: chisimba-dev_default
+    name: chisimba-api-integration

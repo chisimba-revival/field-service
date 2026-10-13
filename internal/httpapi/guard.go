@@ -394,6 +394,88 @@ func (g *Guard) ServeService(scope string) func(ServiceHandler) http.Handler {
 	}
 }
 
+// ServeDispatch is the door for a route that serves both people and services.
+// It authenticates the token once and then applies the rules of whichever door
+// the token belongs to: a person's token is treated exactly as Serve would
+// treat it, and a service token exactly as ServeService would, sharing the one
+// authentication above.
+func (g *Guard) ServeDispatch(person Handler, service ServiceHandler, serviceScope string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearer(r.Header.Get("Authorization"))
+		if !ok {
+			g.refuse(w, r, reasonNoHeader, nil)
+			return
+		}
+		raw, err := g.tokens.Validate(token)
+		if err != nil || raw == nil {
+			g.refuse(w, r, reasonInvalid, err)
+			return
+		}
+		claims, ok := raw.(Principal)
+		if !ok {
+			g.refuse(w, r, reasonInvalid, errors.New("verifier returned claims that are not a Principal"))
+			return
+		}
+		caller := Caller{Principal: claims}
+
+		if caller.Subject() == "" {
+			g.refuse(w, r, reasonNoSubject, nil)
+			return
+		}
+		issuedAt, haveIssuedAt := caller.IssuedAt()
+		if !haveIssuedAt {
+			g.refuse(w, r, reasonRevoked, errors.New("token carries no issue time"))
+			return
+		}
+		revoked, err := g.revoked.Revoked(r.Context(), caller.Subject(), issuedAt, caller.Epoch())
+		if err != nil {
+			g.refuse(w, r, reasonDenylistDown, err)
+			return
+		}
+		if revoked {
+			g.refuse(w, r, reasonRevoked, nil)
+			return
+		}
+
+		if caller.IsService() {
+			if !caller.HasScope(serviceScope) {
+				g.refuse(w, r, reasonScope, fmt.Errorf("scope %q is required", serviceScope))
+				return
+			}
+			// A service route names its context in the request and the handler
+			// opens the transaction there, so this door establishes only that
+			// the caller is a service holding the right scope.
+			if err := service(w, r, caller); err != nil && !errors.Is(err, ErrAnswered) {
+				g.log.Refused(r, reasonHandlerFailed, err)
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"internal_error"}`))
+			}
+			return
+		}
+
+		if !caller.HasScope(g.requiredScope) {
+			g.refuse(w, r, reasonScope, fmt.Errorf("scope %q is required", g.requiredScope))
+			return
+		}
+		grants := caller.Grants()
+		if len(grants) == 0 {
+			g.refuse(w, r, reasonNoGrants, nil)
+			return
+		}
+		err = g.session.InTx(r.Context(), caller.Subject(), grants,
+			func(ctx context.Context) error {
+				return person(w, r, caller)
+			})
+		if err != nil && !errors.Is(err, ErrAnswered) {
+			// The caller was authorised. A handler that fails is an internal
+			// fault and must not be reported as an authorisation problem.
+			g.log.Refused(r, reasonHandlerFailed, err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+	})
+}
+
 // refuse writes the same refusal for every reason.
 //
 // Identical status, body and challenge, so nothing about which check failed is

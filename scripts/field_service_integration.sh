@@ -5,8 +5,17 @@
 
 set -e
 
-API_BASE="http://localhost:8080/api/v1"
-FIELD_SERVICE_BASE="http://localhost:8081"
+API_BASE="${API_BASE:-http://localhost:8080/api/v1}"
+# field-service publishes no host port. It is reached through the stack's TLS
+# gateway, which proxies /field-api/ to it — the same route a field device
+# takes, so this exercises the path that actually exists rather than a back
+# door that only works from this machine. Override GATEWAY_BASE when the stack
+# is not running here.
+GATEWAY_BASE="${GATEWAY_BASE:-https://localhost:8443}"
+FIELD_SERVICE_BASE="$GATEWAY_BASE/field-api"
+# The gateway uses a development certificate. -k is correct for a local test
+# script and would be wrong in a client; nothing here ships.
+CURL_TLS="-k"
 
 echo "=== Field Service Integration Test ==="
 echo "Testing complete integration between Chisimba and Field Service"
@@ -14,7 +23,7 @@ echo ""
 
 # Step 1: Health check field-service
 echo "1. Checking field-service health..."
-HEALTH=$(curl -s $FIELD_SERVICE_BASE/health)
+HEALTH=$(curl -s $CURL_TLS $FIELD_SERVICE_BASE/health)
 if echo "$HEALTH" | grep -q '"status":"ok"'; then
     echo "   ✅ Field service is healthy"
 else
@@ -83,7 +92,7 @@ fi
 echo ""
 echo "5. Testing token validation by field-service..."
 # Try to call sync/push with empty operations (should get validation error, not auth error)
-SYNC_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
+SYNC_RESPONSE=$(curl -s $CURL_TLS -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"operations":[]}' \
   $FIELD_SERVICE_BASE/api/v1/sync/push)
@@ -104,7 +113,7 @@ fi
 # Step 6: Test with actual operation (should fail due to empty context)
 echo ""
 echo "6. Testing with actual operation..."
-SYNC_WITH_OP=$(curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
+SYNC_WITH_OP=$(curl -s $CURL_TLS -X POST -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "operations": [{
